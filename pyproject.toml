@@ -33,6 +33,15 @@ classifiers = [
   "Typing :: Typed",
 ]
 dynamic = ["version"]
+dependencies = [
+  "dask",
+  "event-model",
+  "mongoquery",
+  "pytz",
+  "tiled[client] >=0.2.0",
+  "tzlocal",
+]
+
 
 [project.urls]
 Homepage = "https://github.com/bluesky/bluesky-tiled-plugins"
@@ -44,15 +53,6 @@ Changelog = "https://github.com/bluesky/bluesky-tiled-plugins/releases"
 CatalogOfBlueskyRuns = "bluesky_tiled_plugins.clients.catalog_of_bluesky_runs:CatalogOfBlueskyRuns"
 BlueskyRun = "bluesky_tiled_plugins.clients.bluesky_run:BlueskyRun"
 BlueskyEventStream = "bluesky_tiled_plugins.clients.bluesky_event_stream:BlueskyEventStream"
-
-dependencies = [
-  "dask",
-  "event-model",
-  "mongoquery",
-  "pytz",
-  "tiled[client] >=0.2.0",
-  "tzlocal",
-]
 
 [dependency-groups]
 test = [
