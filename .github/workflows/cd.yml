@@ -56,7 +56,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   docs-build:
-    name: Build documentation
+    name: Documentation build
     runs-on: ubuntu-latest
 
     steps:
