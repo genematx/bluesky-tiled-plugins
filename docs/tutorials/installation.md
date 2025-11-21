@@ -1,5 +1,7 @@
 # Installation
 
+<!-- prettier-ignore-start -->
+
 ::::{tab-set}
 :sync-group: install
 
@@ -82,3 +84,5 @@ pixi add bluesky-tiled-plugins
 :::
 
 ::::
+
+<!-- prettier-ignore-end -->

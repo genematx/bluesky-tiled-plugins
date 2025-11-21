@@ -111,4 +111,3 @@ autodoc2_class_docstring = "both"
 # Which objects to include docstrings for. ‘direct’ means only from objects
 # that are not inherited.
 autodoc2_docstrings = "all"
-

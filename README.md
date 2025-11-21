@@ -21,4 +21,5 @@
 
 <!-- README only content. Anything below this line won't be included in index.md -->
 
-See https://blueskyproject.io/bluesky-tiled-plugins for more detailed documentation.
+See https://blueskyproject.io/bluesky-tiled-plugins for more detailed
+documentation.
