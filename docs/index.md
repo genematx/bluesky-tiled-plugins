@@ -6,7 +6,19 @@ html_theme.sidebar_secondary.remove: true
 :end-before: <!-- README only content
 ```
 
-## How the documentation is structured
+## Overview
+
+The **bluesky-tiled-plugins** repositories provides tools for using [Tiled][]
+with [Bluesky][].
+
+- A Bluesky callback for **saving metadata and data** from Bluesky documents in
+  Tiled
+- Custom Tiled **search queries** targeting Bluesky-specific metadata like
+  `ScanID` and `TimeRange`
+- Classes that **extend the Tiled Python client** to display Bluesky-specific
+  metadata and provide Bluesky-specific convenience methods
+- A Tiled exporter that **"replays" Bluesky documents** reconstructed saved data
+  and metadata
 
 Documentation is split into [four categories](https://diataxis.fr), also
 accessible from links in the top bar.
@@ -57,3 +69,6 @@ Technical reference material including APIs and release notes.
 ::::
 
 <!-- prettier-ignore-end -->
+
+[Bluesky]: https://blueskyproject.io/bluesky
+[Tiled]: https://blueskyproject.io/tiled

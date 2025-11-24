@@ -1,4 +1,4 @@
-# Writing Bluesky Runs into Tiled
+# Saving Bluesky Runs into Tiled
 
 ## Complete Example
 
@@ -38,7 +38,8 @@ data = tiled_client[uid]["primary/img"].read()
 ### Run `SimpleTiledServer`
 
 This starts a tiled server, running on a background thread. This way of running
-the server is intended for "first steps" and embedded deployments.
+the server is intended for "first steps" and embedded deployments. See the guide
+on [deploying Tiled for Bluesky](#deploy-tiled-for-bluesky)
 
 ```python
 # Initialize the Tiled server and client
@@ -55,16 +56,11 @@ tiled_client = from_uri(tiled_server.uri)
 ```
 
 ````{note}
-If running the server in a separate process, such as via,
-
-```sh
-tiled serve catalog --temp
-```
-
-connect in the same way, e.g.
+If running the server in a separate process, provide the appropriate
+address, i.e.
 
 ```python
-tiled_client = from_uri("http://localhost:8000?api_key=...")
+tiled_client = from_uri("http://...")
 ```
 ````
 
