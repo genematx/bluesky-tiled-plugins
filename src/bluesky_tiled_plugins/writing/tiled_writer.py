@@ -481,7 +481,7 @@ class RunNormalizer(DocumentRouter):
             if name in doc["data"].keys():
                 doc["data"][f"_{name}"] = doc["data"].pop(name)
                 doc["timestamps"][f"_{name}"] = doc["timestamps"].pop(name)
-            if name in doc["filled"].keys():
+            if name in doc.get("filled", {}).keys():
                 doc["filled"][f"_{name}"] = doc["filled"].pop(name)
 
         # Part 1. ----- Internal Data -----
