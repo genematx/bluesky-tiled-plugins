@@ -825,6 +825,7 @@ CONSOLIDATOR_REGISTRY = collections.defaultdict(
         "multipart/related;type=image/tiff": TIFFConsolidator,
         "multipart/related;type=image/jpeg": JPEGConsolidator,
         "multipart/related;type=application/x-npy": NPYConsolidator,
+        "application/x-pizzabox-binary": PizzaBoxConsolidator,
     },
 )
 
