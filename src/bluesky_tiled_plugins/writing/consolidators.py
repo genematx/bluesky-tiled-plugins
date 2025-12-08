@@ -476,7 +476,7 @@ class CSVConsolidator(ConsolidatorBase):
             if k in allowed_keys
         }
 
-    def validate(self, adapters_by_mimetype=None, fix_errors=False) -> list[str]:
+    def validate(self, fix_errors=False) -> list[str]:
         # CSVConsolidator needs special handling to validate the structure when the data_type is StructDtype.
         # In this case, we need to check that the number of columns, their names and dtypes match.
         # The shape and chunks are also validated.
@@ -593,9 +593,7 @@ class CSVConsolidator(ConsolidatorBase):
             assert self.get_adapter() is not None, "Adapter can not be initialized"
 
         else:
-            notes = super().validate(
-                adapters_by_mimetype=adapters_by_mimetype, fix_errors=fix_errors
-            )
+            notes = super().validate(fix_errors=fix_errors)
 
         return notes
 
