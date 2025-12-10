@@ -782,6 +782,16 @@ class _RunWriter(DocumentRouter):
                 try:
                     _notes = consolidator.validate(fix_errors=True)
                     notes.extend([title + ": " + note for note in _notes])
+                except FileNotFoundError as e:
+                    if not Path(e.filename).exists() and Path(e.filename).parent.exists():
+                        msg = title + f" failed with error: {e.filename} is not found, " \
+                            + "but its parent directory exists and is readable."
+                        notes.append(msg)
+                        logger.error(msg + " Continuing validation.")
+                    else:
+                        msg = title + f" failed with error: neither {e.filename}, " \
+                            + "nor its parent directory exist. Cannot continue validation."
+                        raise ValidationError(msg) from e
                 except Exception as e:
                     msg = (
                         f"{type(e).__name__}: "
