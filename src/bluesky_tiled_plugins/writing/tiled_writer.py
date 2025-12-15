@@ -330,7 +330,10 @@ class RunNormalizer(DocumentRouter):
         # previous frame index.
         datum_kwargs = datum_doc.get("datum_kwargs", {})
         frame = datum_kwargs.pop("frame", None)
-        if frame is not None:
+        indices = datum_kwargs.pop("indices", None)
+        if indices is not None:
+            index_start, index_stop = indices["start"], indices["stop"]
+        elif frame is not None:
             desc_name = self._desc_name_by_uid[
                 desc_uid
             ]  # Name of the descriptor (stream)
