@@ -328,6 +328,8 @@ class RunNormalizer(DocumentRouter):
         # There are cases when the frame_index is reset during the scan (e.g. if Datums for the same
         # data_key belong to different Resources), so the 'carry' field is used to keep track of the
         # previous frame index.
+        # In case when the index needs to RESET for each Resource, the `indices` dictionary should be
+        # included in the datum_kwargs directly.
         datum_kwargs = datum_doc.get("datum_kwargs", {})
         frame = datum_kwargs.pop("frame", None)
         indices = datum_kwargs.pop("indices", None)
