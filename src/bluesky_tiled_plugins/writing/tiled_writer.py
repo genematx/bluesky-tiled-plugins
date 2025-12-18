@@ -644,6 +644,7 @@ class _RunWriter(DocumentRouter):
         self._validate: bool = validate
         self.data_keys: dict[str, DataKey] = {}
         self.access_tags: list[str] | None = None
+        self.notes: list[str] = []
 
     def _write_internal_data(
         self, data_cache: list[dict[str, Any]], desc_node: Container
@@ -653,7 +654,17 @@ class _RunWriter(DocumentRouter):
         desc_name = desc_node.item["id"]  # Name of the descriptor (stream)
         # 1. Write internal array data, if any; remove it from the tabular data
         for key in self._int_array_keys[desc_name]:
-            array = numpy.array([row.pop(key) for row in data_cache if key in row])
+            arr_lst = [row.pop(key) for row in data_cache if key in row]
+            min_len, max_len = min(len(row) for row in arr_lst), max(len(row) for row in arr_lst)
+
+            # Pad the arrays with NaNs to make them the same length if necessary
+            if min_len != max_len:
+                arr_lst = [row + [np.nan] * (max_len - len(row)) for row in arr_lst]
+                msg = (f"Array lengths for key {key} are not consistent: min={min_len}, max={max_len}; "
+                        "the arrays are padded with NaNs.")
+                logger.warning(msg)
+                self.notes.append(msg)
+            array = numpy.array(arr_lst)
             if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):
                 # Create a new "internal" array data node and write the initial piece of data
                 metadata = truncate_json_overflow(self.data_keys.get(key, {}))
@@ -776,7 +787,6 @@ class _RunWriter(DocumentRouter):
             )
 
         # Validate structure for some StreamResource nodes, select unique pairs of (sres_node, consolidator)
-        notes = []
         node_and_cons = {
             (sres_node, self._consolidators[sres_uid])
             for sres_uid, sres_node in self._sres_nodes.items()
@@ -786,12 +796,12 @@ class _RunWriter(DocumentRouter):
                 title = f"Validation of data key '{sres_node.item['id']}'"
                 try:
                     _notes = consolidator.validate(fix_errors=True)
-                    notes.extend([title + ": " + note for note in _notes])
+                    self.notes.extend([title + ": " + note for note in _notes])
                 except FileNotFoundError as e:
                     if (e.filename is not None) and (not Path(e.filename).exists()) and Path(e.filename).parent.exists():
                         msg = title + f" failed with error: {e.filename} is not found, " \
                             + "but its parent directory exists and is readable."
-                        notes.append(msg)
+                        self.notes.append(msg)
                         logger.error(msg + " Continuing validation.")
                     elif e.filename is None:
                         msg = title + f" failed with error: {e}"
@@ -815,7 +825,7 @@ class _RunWriter(DocumentRouter):
         for key in self._internal_arrays.keys():
             notes.append(f"Internal array data in '{key}' written as zarr format.")
         notes = (
-            doc.pop("_run_normalizer_notes", []) + notes
+            doc.pop("_run_normalizer_notes", []) + self.notes
         )  # Retrieve notes from the normalizer, if any
         md_update = {"stop": doc, **({"notes": notes} if notes else {})}
         self.root_node.update_metadata(metadata=md_update, drop_revision=True)
