@@ -659,9 +659,9 @@ class _RunWriter(DocumentRouter):
 
             # Pad the arrays with NaNs to make them the same length if necessary
             if min_len != max_len:
-                arr_lst = [row + [np.nan] * (max_len - len(row)) for row in arr_lst]
-                msg = (f"Array lengths for key {key} are not consistent: min={min_len}, max={max_len}; "
-                        "the arrays are padded with NaNs.")
+                arr_lst = [row + [numpy.nan] * (max_len - len(row)) for row in arr_lst]
+                msg = (f"Array lengths for key '{key}' in stream '{desc_name}' are not consistent: "
+                       f"min={min_len}, max={max_len}; the arrays are padded with NaNs.")
                 logger.warning(msg)
                 self.notes.append(msg)
             array = numpy.array(arr_lst)
@@ -677,6 +677,7 @@ class _RunWriter(DocumentRouter):
                     access_tags=self.access_tags,
                 )
                 self._internal_arrays[f"{desc_name}/{key}"] = arr_client
+                self.notes.append(f"Internal array data for '{key}' in stream '{desc_name}' written as zarr.")
             else:
                 arr_client.patch(array, offset=arr_client.shape[:1], extend=True)
 
@@ -822,8 +823,6 @@ class _RunWriter(DocumentRouter):
                 )
 
         # Write the stop document to the metadata
-        for key in self._internal_arrays.keys():
-            notes.append(f"Internal array data in '{key}' written as zarr format.")
         notes = (
             doc.pop("_run_normalizer_notes", []) + self.notes
         )  # Retrieve notes from the normalizer, if any
