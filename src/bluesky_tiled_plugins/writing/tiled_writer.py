@@ -805,8 +805,17 @@ class _RunWriter(DocumentRouter):
                         self.notes.append(msg)
                         logger.error(msg + " Continuing validation.")
                     elif e.filename is None:
-                        msg = title + f" failed with error: {e}"
-                        raise ValidationError(msg) from e
+                        if 'No such file or directory' in str(e):
+                            if m := re.search(r":\s*'([^']+)'$", str(e)):
+                                fpath = m.group(1)
+                                if (not Path(fpath).exists()) and Path(fpath).parent.exists():
+                                    msg = title + f" failed with error: {fpath} is not found, " \
+                                        + "but its parent directory exists and is readable."
+                                    self.notes.append(msg)
+                                    logger.error(msg + " Continuing validation.")
+                        else:
+                            msg = title + f" failed with error: {e}"
+                            raise ValidationError(msg) from e
                     else:
                         msg = title + f" failed with error: neither {e.filename}, " \
                             + "nor its parent directory exist. Cannot continue validation."
