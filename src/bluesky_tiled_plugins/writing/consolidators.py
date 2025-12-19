@@ -484,6 +484,7 @@ class CSVConsolidator(ConsolidatorBase):
 
         if isinstance(self.data_type, StructDtype):
             from tiled.adapters.csv import CSVAdapter
+            import pyarrow.types as patypes
 
             uris = [asset.data_uri for asset in self.assets]
             adapter = CSVAdapter.from_uris(
@@ -498,12 +499,15 @@ class CSVConsolidator(ConsolidatorBase):
                 )
 
             # Construct the true StructDtype of the data as read by the adapter
-            true_numpy_dtype = np.dtype(
-                [
-                    (expected.name, true.to_pandas_dtype())
-                    for expected, true in zip(self.data_type.fields, column_dtypes)
-                ]
-            )
+            true_column_names_dtypes = []
+            for indx, expected, true_column_dtype in zip(range(len(self.data_type.fields)), self.data_type.fields, column_dtypes):
+                if patypes.is_string(true_column_dtype) or patypes.is_large_string(true_column_dtype):
+                    _true_dtype = np.array([str(x) for x in adapter.read(indx)]).dtype   # becomes "<Un" dtype
+                else:
+                    _true_dtype = true_column_dtype.to_pandas_dtype()
+                true_column_names_dtypes.append((expected.name, _true_dtype))
+
+            true_numpy_dtype = np.dtype(true_column_names_dtypes)
             true_dtype = StructDtype.from_numpy_dtype(true_numpy_dtype)
 
             if self.data_type != true_dtype:
