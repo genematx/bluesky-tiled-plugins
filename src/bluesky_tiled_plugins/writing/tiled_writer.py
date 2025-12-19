@@ -806,6 +806,7 @@ class _RunWriter(DocumentRouter):
                         logger.error(msg + " Continuing validation.")
                     elif e.filename is None:
                         if 'No such file or directory' in str(e):
+                            import re
                             if m := re.search(r":\s*'([^']+)'$", str(e)):
                                 fpath = m.group(1)
                                 if (not Path(fpath).exists()) and Path(fpath).parent.exists():
