@@ -799,7 +799,7 @@ class _RunWriter(DocumentRouter):
                     _notes = consolidator.validate(fix_errors=True)
                     self.notes.extend([title + ": " + note for note in _notes])
                 except FileNotFoundError as e:
-                    if (e.filename is not None) and (not Path(e.filename).exists()) and Path(e.filename).parent.exists():
+                    if (e.filename is not None) and Path(e.filename).parent.exists():
                         msg = title + f" failed with error: {e.filename} is not found, " \
                             + "but its parent directory exists and is readable."
                         self.notes.append(msg)

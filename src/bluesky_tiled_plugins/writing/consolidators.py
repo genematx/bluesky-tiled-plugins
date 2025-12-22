@@ -6,6 +6,7 @@ import os
 import re
 import warnings
 from typing import Literal, cast
+from pathlib import Path
 
 import numpy as np
 from event_model.documents import EventDescriptor, StreamDatum, StreamResource
@@ -13,7 +14,7 @@ from tiled.mimetypes import DEFAULT_ADAPTERS_BY_MIMETYPE
 from tiled.structures.array import ArrayStructure, BuiltinDtype, StructDtype
 from tiled.structures.core import StructureFamily
 from tiled.structures.data_source import Asset, DataSource, Management
-from tiled.utils import OneShotCachedMap
+from tiled.utils import OneShotCachedMap, path_from_uri
 
 # User-provided adapters take precedence over defaults.
 CUSTOM_ADAPTERS_BY_MIMETYPE = OneShotCachedMap[str, type](
@@ -366,6 +367,13 @@ class ConsolidatorBase:
         # Initialize adapter from uris and determine the structure
         adapter_class = DEFAULT_ADAPTERS_BY_MIMETYPE[self.mimetype]
         uris = [asset.data_uri for asset in self.assets]
+
+        # Check that the files exist
+        for uri in uris:
+            fpath = Path(path_from_uri(uri))
+            if not fpath.exists() or (fpath.is_file() and fpath.stat().st_size == 0):
+                raise FileNotFoundError(2, "No such file or directory or it is empty", str(fpath))
+
         structure = adapter_class.from_uris(
             *uris, **self.adapter_parameters()
         ).structure()
