@@ -449,6 +449,10 @@ class RunNormalizer(DocumentRouter):
             ):
                 data_keys_spec["dtype_numpy"] = dtype_numpy
 
+            # Ensure that shape is not None; if so, set it to an empty tuple
+            if "shape" in data_keys_spec and data_keys_spec.get("shape") is None:
+                data_keys_spec["shape"] = ()
+
         # Ensure that all event data_keys have object_name assigned, if known (for consistency)
         # If "object_keys" are not present, do not reconstruct them -- they are optional
         for obj_name, data_keys_list in doc.get("object_keys", {}).items():
