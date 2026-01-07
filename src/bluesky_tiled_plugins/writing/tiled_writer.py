@@ -832,7 +832,7 @@ class _RunWriter(DocumentRouter):
                     )
                     msg = title + f" failed with error: {msg}"
                     if "PCAP.TS_TRIG.Value" in str(e):
-                        logger.error(msg + " Continuing validation.")
+                        logger.warning(msg + " Continuing validation.")
                     else:
                         raise ValidationError(msg) from e
                 self._update_data_source_for_node(
