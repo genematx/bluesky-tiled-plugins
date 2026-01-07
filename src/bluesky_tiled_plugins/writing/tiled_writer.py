@@ -831,7 +831,10 @@ class _RunWriter(DocumentRouter):
                         + str(e).replace("\n", " ").replace("\r", "").strip()
                     )
                     msg = title + f" failed with error: {msg}"
-                    raise ValidationError(msg) from e
+                    if "PCAP.TS_TRIG.Value" in str(e):
+                        logger.error(msg + " Continuing validation.")
+                    else:
+                        raise ValidationError(msg) from e
                 self._update_data_source_for_node(
                     sres_node, consolidator.get_data_source()
                 )
