@@ -7,4 +7,5 @@ Practical step-by-step guides and more advanced examples.
 :glob:
 
 how-to/deploy
+how-to/exporters
 ```
