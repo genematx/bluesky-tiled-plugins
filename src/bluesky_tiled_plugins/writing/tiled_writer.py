@@ -36,7 +36,7 @@ from tiled.client.array import ArrayClient
 from tiled.client.base import BaseClient
 from tiled.client.container import Container
 from tiled.client.dataframe import DataFrameClient
-from tiled.client.utils import handle_error
+from tiled.client.utils import handle_error, retry_context
 from tiled.structures.core import Spec
 from tiled.utils import safe_json_dump
 
@@ -201,13 +201,19 @@ class _ConditionalBackup:
 
 
 class RunNormalizer(DocumentRouter):
-    """Callback for updating Bluesky documents to their latest schema.
+    def __init__(
+        self,
+        patches: dict[str, Callable] | None = None,
+        spec_to_mimetype: dict[str, str] | None = None,
+    ):
+        """Callback for updating Bluesky documents to their latest schema.
 
-    This callback can be used to subscribe additional consumers that require the updated documents.
-    Returns a shallow copy of the document to avoid modifying the original one.
+        This callback can be used to subscribe additional consumers that require the updated documents.
+        Returns a shallow copy of the document to avoid modifying the original one.
 
-    Parameters
-    ----------
+        Parameters
+        ----------
+
         patches : dict[str, Callable], optional
             A dictionary of patch functions to apply to the documents before modifying them.
             The keys are document names (e.g., "start", "stop", "descriptor", etc.), and the values
@@ -216,13 +222,8 @@ class RunNormalizer(DocumentRouter):
             A dictionary mapping spec names to MIME types. This is used to convert `Resource` documents
             to the latest `StreamResource` schema.
             The supplied dictionary updates the default `MIMETYPE_LOOKUP` dictionary.
-    """
+        """
 
-    def __init__(
-        self,
-        patches: dict[str, Callable] | None = None,
-        spec_to_mimetype: dict[str, str] | None = None,
-    ):
         self._token_refs: dict[str, Callable] = {}
         self.dispatcher = Dispatcher()
         self.patches = patches or {}
@@ -303,6 +304,7 @@ class RunNormalizer(DocumentRouter):
 
         Parameters
         ----------
+
         datum_doc : Datum
             The Datum document to convert.
         data_key : str
@@ -598,21 +600,6 @@ class RunNormalizer(DocumentRouter):
 
 
 class _RunWriter(DocumentRouter):
-    """Write documents from a single Bluesky Run into Tiled.
-
-    This callback is intended to be used with a `RunRouter` and process documents from a single Bluesky run.
-    It creates a new Tiled Container for the run and writes the internal data provided in Event documents
-    as well as registers external files provided in StreamResource and StreamDatum documents.
-
-    The callback is intended to be used with the most recent version of EventModel; to support legacy
-    schemas, use the `RunNormalizer` callback first to update the documents before writing them to Tiled.
-
-    Parameters
-    ----------
-        client : BaseClient
-            The Tiled client to use for writing the data.
-    """
-
     def __init__(
         self,
         client: BaseClient,
@@ -620,6 +607,22 @@ class _RunWriter(DocumentRouter):
         max_array_size: int = MAX_ARRAY_SIZE,
         validate: bool = False,
     ):
+        """Write documents from a single Bluesky Run into Tiled.
+
+        This callback is intended to be used with a `RunRouter` and process documents from a single Bluesky run.
+        It creates a new Tiled Container for the run and writes the internal data provided in Event documents
+        as well as registers external files provided in StreamResource and StreamDatum documents.
+
+        The callback is intended to be used with the most recent version of EventModel; to support legacy
+        schemas, use the `RunNormalizer` callback first to update the documents before writing them to Tiled.
+
+        Parameters
+        ----------
+
+        client : BaseClient
+            The Tiled client to use for writing the data.
+        """
+
         self.client = client
         self.root_node: None | Container = None
         self._desc_nodes: dict[
@@ -732,18 +735,20 @@ class _RunWriter(DocumentRouter):
         data_source.id = node.data_sources()[
             0
         ].id  # ID of the existing DataSource record
-        handle_error(
-            node.context.http_client.put(
-                node.uri.replace("/metadata/", "/data_source/", 1),
-                content=safe_json_dump({"data_source": data_source}),
-                params={
-                    "patch_shape": ",".join(map(str, patch.shape)),
-                    "patch_offset": ",".join(map(str, patch.offset)),
-                }
-                if patch
-                else None,
-            )
-        ).json()
+
+        for attempt in retry_context():
+            with attempt:
+                response = node.context.http_client.put(
+                    node.uri.replace("/metadata/", "/data_source/", 1),
+                    content=safe_json_dump({"data_source": data_source}),
+                    params={
+                        "patch_shape": ",".join(map(str, patch.shape)),
+                        "patch_offset": ",".join(map(str, patch.offset)),
+                    }
+                    if patch
+                    else None,
+                )
+        handle_error(response)
 
     def _write_external_data(self, doc: StreamDatum):
         """Register (or update) the external data from StreamDatum in Tiled"""
@@ -1000,14 +1005,27 @@ class _RunWriter(DocumentRouter):
 
 
 class TiledWriter:
-    """Callback for write metadata and data from Bluesky documents into Tiled.
+    def __init__(
+        self,
+        client: BaseClient,
+        *,
+        normalizer: type[DocumentRouter] | None = RunNormalizer,
+        patches: dict[str, Callable] | None = None,
+        spec_to_mimetype: dict[str, str] | None = None,
+        backup_directory: str | None = None,
+        batch_size: int = BATCH_SIZE,
+        max_array_size: int = MAX_ARRAY_SIZE,
+        validate: bool = False,
+    ):
+        """Callback for write metadata and data from Bluesky documents into Tiled.
 
-    This callback relies on the `RunRouter` to route documents from one or more runs into
-    independent instances of the `_RunWriter` callback. The `RunRouter` is responsible for
-    creating a new instance of the `_RunWriter` for each run.
+        This callback relies on the `RunRouter` to route documents from one or more runs into
+        independent instances of the `_RunWriter` callback. The `RunRouter` is responsible for
+        creating a new instance of the `_RunWriter` for each run.
 
-    Parameters
-    ----------
+        Parameters
+        ----------
+
         client : `tiled.client.BaseClient`
             The Tiled client to use for writing data. This client must be initialized with
             the appropriate credentials and connection parameters to access the Tiled server.
@@ -1040,20 +1058,8 @@ class TiledWriter:
         validate : bool
             If True, validate all data sources before writing to Tiled. This requires the access to the
             files on the client.
-    """
+        """
 
-    def __init__(
-        self,
-        client: BaseClient,
-        *,
-        normalizer: type[DocumentRouter] | None = RunNormalizer,
-        patches: dict[str, Callable] | None = None,
-        spec_to_mimetype: dict[str, str] | None = None,
-        backup_directory: str | None = None,
-        batch_size: int = BATCH_SIZE,
-        max_array_size: int = MAX_ARRAY_SIZE,
-        validate: bool = False,
-    ):
         self.client = client.include_data_sources()
         self.patches = patches or {}
         self.spec_to_mimetype = spec_to_mimetype or {}

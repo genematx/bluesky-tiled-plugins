@@ -1,32 +1,40 @@
 import logging
+import re
 import time
 
-from tiled.client import from_profile
 from tiled.client.array import ArrayClient
 from tiled.client.dataframe import DataFrameClient
-from tiled.client.utils import handle_error
+from tiled.client.utils import handle_error, retry_context
 from tiled.mimetypes import DEFAULT_ADAPTERS_BY_MIMETYPE as ADAPTERS_BY_MIMETYPE
 from tiled.utils import safe_json_dump
 
 logger = logging.getLogger(__name__)
 
 class ValidationException(Exception):
-
     def __init__(self, message, uid=None):
         super().__init__(message)
         self.uid = uid
 
+
 class ReadingValidationException(ValidationException):
     pass
 
+
 class RunValidationException(ValidationException):
     pass
+
 
 class MetadataValidationException(ValidationException):
     pass
 
 
-def validate(root_client, fix_errors=True, try_reading=True, raise_on_error=False, ignore_errors=[]):
+def validate(
+    root_client,
+    fix_errors=True,
+    try_reading=True,
+    raise_on_error=False,
+    ignore_errors=[],
+):
     """Validate the given BlueskyRun client for completeness and data integrity.
 
     Parameters
@@ -61,7 +69,9 @@ def validate(root_client, fix_errors=True, try_reading=True, raise_on_error=Fals
 
     # Check all streams and data keys
     errored_keys, notes = [], []
-    streams_node = root_client['streams'] if 'streams' in root_client.keys() else root_client
+    streams_node = (
+        root_client["streams"] if "streams" in root_client.keys() else root_client
+    )
     for sname, stream in streams_node.items():
         for data_key in stream.base:
             if data_key == "internal":
@@ -77,9 +87,14 @@ def validate(root_client, fix_errors=True, try_reading=True, raise_on_error=Fals
                 _notes = validate_structure(data_client, fix_errors=fix_errors)
                 notes.extend([title + ": " + note for note in _notes])
             except Exception as e:
-                msg = f"{type(e).__name__}: " + str(e).replace("\n", " ").replace("\r", "").strip()
+                msg = (
+                    f"{type(e).__name__}: "
+                    + str(e).replace("\n", " ").replace("\r", "").strip()
+                )
                 msg = title + f" failed with error: {msg}"
-                logger.warning(msg)
+                logger.error(msg)
+                if raise_on_error:
+                    raise e
                 notes.append(msg)
 
             # Validate reading of the data
@@ -88,28 +103,29 @@ def validate(root_client, fix_errors=True, try_reading=True, raise_on_error=Fals
                     validate_reading(data_client, ignore_errors=ignore_errors)
                 except Exception as e:
                     errored_keys.append((sname, data_key, str(e)))
-                    logger.error(f"Reading validation of '{sname}/{data_key}' failed with error: {e}")
+                    logger.error(
+                        f"Reading validation of '{sname}/{data_key}' failed with error: {e}"
+                    )
                     if raise_on_error:
                         raise e
 
             time.sleep(0.1)
 
     if try_reading and (not errored_keys):
-        logger.info(f"Reading validation completed successfully.")
+        logger.info("Reading validation completed successfully.")
 
     # Update the root metadata with validation notes
     if notes:
         existing_notes = root_client.metadata.get("notes", [])
         root_client.update_metadata(
-            {"notes": existing_notes + notes},
-            drop_revision=True,
+            {"notes": existing_notes + notes}, drop_revision=True
         )
 
     return not errored_keys
 
 
 def validate_reading(data_client, ignore_errors=[]):
-    """Attempt to read data from the given data client to validate data accessibility.
+    """Attempt to read data from the given data client to validate data accessibility
 
     Parameters
     ----------
@@ -118,37 +134,46 @@ def validate_reading(data_client, ignore_errors=[]):
         ignore_errors : list of str, optional
             List of error messages to ignore during reading validation.
             Default is an empty list.
-    
+
     Raises
     ------
         ReadingValidationException
             If reading the data fails with an unignored error.
     """
 
-    data_key = data_client.item['id']
-    sname = data_client.item['attributes']['ancestors'][-1]  # stream name
+    data_key = data_client.item["id"]
+    sname = data_client.item["attributes"]["ancestors"][-1]  # stream name
 
     if isinstance(data_client, ArrayClient):
         try:
-            data_client[*(0,)*len(data_client.shape)]  # try to read the first element
-            data_client[*(-1,)*len(data_client.shape)]  # try to read the last element
+            # Try to read the first and last elements
+            idx_left_top = (0,) * len(data_client.shape)
+            data_client[idx_left_top]
+            idx_right_bottom = (-1,) * len(data_client.shape)
+            data_client[idx_right_bottom]
         except Exception as e:
-            if any([msg in e.args[0] for msg in ignore_errors]):
-                logger.info(f"Ignoring array reading error: {sname}/{data_key}: {e.args[0]}")
+            if any([re.search(msg, str(e)) for msg in ignore_errors]):
+                logger.info(f"Ignoring array reading error: {sname}/{data_key}: {e}")
             else:
-                raise ReadingValidationException(f"Array reading failed with error: {e.args[0]}")
+                raise ReadingValidationException(
+                    f"Array reading failed with error: {e}"
+                )
 
     elif isinstance(data_client, DataFrameClient):
         try:
             data_client.read()  # try to read the entire table
         except Exception as e:
-            if any([msg in e.args[0] for msg in ignore_errors]):
-                logger.info(f"Ignoring table reading error: {sname}/{data_key}: {e.args[0]}")
+            if any([re.search(msg, str(e)) for msg in ignore_errors]):
+                logger.info(f"Ignoring table reading error: {sname}/{data_key}: {e}")
             else:
-                raise ReadingValidationException(f"Table reading failed with error: {e.args[0]}")
+                raise ReadingValidationException(
+                    f"Table reading failed with error: {e}"
+                )
 
     else:
-        logger.warning(f"Validation of '{data_key=}' is not supported with client of type {type(data_client)}.")
+        logger.warning(
+            f"Validation of '{data_key=}' is not supported with client of type {type(data_client)}."
+        )
 
 
 def validate_structure(data_client, fix_errors=False) -> list[str]:
@@ -165,7 +190,7 @@ def validate_structure(data_client, fix_errors=False) -> list[str]:
     Returns
     -------
         list of str
-            A list of notes describing any fixes applied during validation.
+            A list of human-readable notes describing any fixes applied during validation.
     """
 
     data_source = data_client.data_sources()[0]
@@ -175,7 +200,9 @@ def validate_structure(data_client, fix_errors=False) -> list[str]:
 
     # Initialize adapter from uris and determine the structure as read by the adapter
     adapter_class = ADAPTERS_BY_MIMETYPE[data_source.mimetype]
-    true_structure = adapter_class.from_uris(*uris, **data_source.parameters).structure()
+    true_structure = adapter_class.from_uris(
+        *uris, **data_source.parameters
+    ).structure()
     true_data_type = true_structure.data_type
     true_shape = true_structure.shape
     true_chunks = true_structure.chunks
@@ -192,7 +219,9 @@ def validate_structure(data_client, fix_errors=False) -> list[str]:
 
     if structure.chunks != true_chunks:
         if not fix_errors:
-            raise ValueError(f"Chunk shape mismatch: {structure.chunks} != {true_chunks}")
+            raise ValueError(
+                f"Chunk shape mismatch: {structure.chunks} != {true_chunks}"
+            )
         else:
             _true_chunk_shape = tuple(c[0] for c in true_chunks)
             _chunk_shape = tuple(c[0] for c in structure.chunks)
@@ -203,7 +232,9 @@ def validate_structure(data_client, fix_errors=False) -> list[str]:
 
     if structure.data_type != true_data_type:
         if not fix_errors:
-            raise ValueError(f"dtype mismatch: {structure.data_type} != {true_data_type}")
+            raise ValueError(
+                f"Data type mismatch: {structure.data_type} != {true_data_type}"
+            )
         else:
             msg = f"Fixed dtype mismatch: {structure.data_type.to_numpy_dtype()} -> {true_data_type.to_numpy_dtype()}"  # noqa
             logger.warning(msg)
@@ -212,11 +243,19 @@ def validate_structure(data_client, fix_errors=False) -> list[str]:
 
     if structure.dims and (len(structure.dims) != len(true_shape)):
         if not fix_errors:
-            raise ValueError(f"Number of dimension names mismatch for a {len(true_shape)}-dimensional array: {structure.dims}")  # noqa
+            raise ValueError(
+                f"Number of dimension names mismatch for a {len(true_shape)}-dimensional array: {structure.dims}"
+            )  # noqa
         else:
             old_dims = structure.dims
             if len(old_dims) < len(true_shape):
-                structure.dims = ("time",) + old_dims + tuple(f"dim{i}" for i in range(len(old_dims)+1, len(true_shape)))
+                structure.dims = (
+                    ("time",)
+                    + old_dims
+                    + tuple(
+                        f"dim{i}" for i in range(len(old_dims) + 1, len(true_shape))
+                    )
+                )
             else:
                 structure.dims = old_dims[: len(true_shape)]
             msg = f"Fixed dimension names: {old_dims} -> {structure.dims}"
@@ -226,11 +265,14 @@ def validate_structure(data_client, fix_errors=False) -> list[str]:
     # Update the data source structure if any fixes were applied
     if notes:
         data_source.structure = structure
-        handle_error(
-            data_client.context.http_client.put(
-                data_client.uri.replace("/api/v1/metadata/", "/api/v1/data_source/", 1),
-                content=safe_json_dump({"data_source": data_source}),
-            )
-        ).json()
+        for attempt in retry_context():
+            with attempt:
+                response = data_client.context.http_client.put(
+                    data_client.uri.replace(
+                        "/api/v1/metadata/", "/api/v1/data_source/", 1
+                    ),
+                    content=safe_json_dump({"data_source": data_source}),
+                )
+        handle_error(response)
 
     return notes

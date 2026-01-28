@@ -6,7 +6,7 @@ import operator
 from typing import Any
 
 from tiled.client.container import Container
-from tiled.client.utils import handle_error
+from tiled.client.utils import handle_error, retry_context
 from tiled.queries import Comparison, Eq, Like
 from tiled.utils import safe_json_dump
 
@@ -214,7 +214,9 @@ class CatalogOfBlueskyRuns(Container):
             result = super().search(query)
         else:
             if hasattr(query, "key"):
-                if not query.key.startswith("start.") or query.key.startswith("stop."):
+                if not (
+                    query.key.startswith("start.") or query.key.startswith("stop.")
+                ):
                     # Default to searching RunStart document.
                     query = copy.copy(query)
                     query.key = f"start.{query.key}"
@@ -223,9 +225,11 @@ class CatalogOfBlueskyRuns(Container):
 
     def post_document(self, name, doc):
         link = self.item["links"]["self"].replace("/metadata", "/documents", 1)
-        response = self.context.http_client.post(
-            link, content=safe_json_dump({"name": name, "doc": doc})
-        )
+        for attempt in retry_context():
+            with attempt:
+                response = self.context.http_client.post(
+                    link, content=safe_json_dump({"name": name, "doc": doc})
+                )
         handle_error(response)
 
 
