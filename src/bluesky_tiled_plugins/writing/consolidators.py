@@ -14,7 +14,7 @@ from tiled.mimetypes import DEFAULT_ADAPTERS_BY_MIMETYPE
 from tiled.structures.array import ArrayStructure, BuiltinDtype, StructDtype
 from tiled.structures.core import StructureFamily
 from tiled.structures.data_source import Asset, DataSource, Management
-from tiled.utils import OneShotCachedMap, path_from_uri
+from tiled.utils import OneShotCachedMap, path_from_uri, ensure_uri
 
 # User-provided adapters take precedence over defaults.
 CUSTOM_ADAPTERS_BY_MIMETYPE = OneShotCachedMap[str, type](
@@ -130,9 +130,15 @@ class ConsolidatorBase:
 
         self.data_key = stream_resource["data_key"]
         self.uri = stream_resource["uri"]
-        self.assets: list[Asset] = [
-            Asset(data_uri=self.uri, is_directory=False, parameter="data_uris", num=0)
-        ]
+        if (stream_resource["parameters"].get("_resource_spec") == 'AD_EIGER_MX') \
+            and (stream_resource["parameters"].get("data_key") == "data"):
+            self.assets: list[Asset] = [
+            Asset(data_uri=self.uri, is_directory=False, parameter="master")
+            ]
+        else:
+            self.assets: list[Asset] = [
+                Asset(data_uri=self.uri, is_directory=False, parameter="data_uris", num=0)
+            ]
         self._sres_parameters = stream_resource["parameters"]
 
         # Find datum shape and machine dtype
@@ -654,6 +660,45 @@ class HDF5Consolidator(ConsolidatorBase):
         )
         self.assets.append(asset)
 
+    def validate(self, fix_errors=False) -> list[str]:
+        if (self._sres_parameters.get("_resource_spec") == 'AD_EIGER_MX') \
+            and (self._sres_parameters.get("data_key") == "data"):
+            # Special handling for NexusMX HDF5 files where data is stored in several linked files
+            if len(self.assets) != 1:
+                raise ValueError("NexusMX HDF5 dataset must be referenced by a single master file.")
+            master_uri = self.assets[0].data_uri
+            master_fpath = path_from_uri(master_uri)
+            self.assets.clear()
+
+            # Repopulate assets based on the linked files
+            import h5py
+
+            with h5py.File(master_fpath, 'r') as f:
+                for i, key in enumerate(f['/entry/data'].keys()):
+                    link = f['/entry/data'].get(key, getlink=True)
+                    self.assets.append(
+                        Asset(
+                            data_uri=ensure_uri(master_fpath.with_name(link.filename)),
+                            is_directory=False,
+                            parameter="data_uris",
+                            num=i,
+                        )
+                    )
+                    self._sres_parameters['dataset'] = link.path  # assume all links point to the same dataset path
+        
+            # Proceed with usual validation
+            notes = super().validate(fix_errors=fix_errors)
+
+            # Keep the master file as a separate asset
+            self.assets.append(Asset(data_uri=master_uri, is_directory=False, parameter="master"))
+
+            msg = "Rebuilt the list of Assets from external linked files. Added the master NexusMX HDF5 file as a separate asset."
+            warnings.warn(msg, stacklevel=2)
+            notes.append(msg)
+        else:
+            notes = super().validate(fix_errors=fix_errors)
+
+        return notes
 
 class MultipartRelatedConsolidator(ConsolidatorBase):
     def __init__(
