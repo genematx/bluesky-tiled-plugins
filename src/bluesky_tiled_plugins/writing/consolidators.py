@@ -692,7 +692,7 @@ class HDF5Consolidator(ConsolidatorBase):
             # Keep the master file as a separate asset
             self.assets.append(Asset(data_uri=master_uri, is_directory=False, parameter="master"))
 
-            msg = "Rebuilt the list of Assets from external linked files. Added the master NexusMX HDF5 file as a separate asset."
+            msg = "Added linked files to the set of assets."
             warnings.warn(msg, stacklevel=2)
             notes.append(msg)
         else:
