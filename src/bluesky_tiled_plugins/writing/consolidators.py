@@ -135,6 +135,8 @@ class ConsolidatorBase:
             self.assets: list[Asset] = [
             Asset(data_uri=self.uri, is_directory=False, parameter="master")
             ]
+        elif self.mimetype in {"image/jpeg", "image/tiff"}:
+            self.assets: list[Asset] = [Asset(data_uri=self.uri, is_directory=False, parameter="data_uri")]
         else:
             self.assets: list[Asset] = [
                 Asset(data_uri=self.uri, is_directory=False, parameter="data_uris", num=0)
