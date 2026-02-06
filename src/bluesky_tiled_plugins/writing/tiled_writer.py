@@ -416,15 +416,18 @@ class RunNormalizer(DocumentRouter):
         # Rename data_keys that use reserved words, "time" and "seq_num"
         for name in RESERVED_DATA_KEYS:
             if name in doc["data_keys"].keys():
-                if f"_{name}" in doc["data_keys"].keys():
+                if f"{name}_" in doc["data_keys"].keys():
                     raise ValueError(
-                        f"Cannot rename {name} to _{name} because it already exists"
+                        f"Cannot rename {name} to {name}_ because it already exists"
                     )
-                doc["data_keys"][f"_{name}"] = doc["data_keys"].pop(name)
+                doc["data_keys"][f"{name}_"] = doc["data_keys"].pop(name)
                 for obj_data_keys_list in doc.get("object_keys", {}).values():
                     if name in obj_data_keys_list:
                         obj_data_keys_list.remove(name)
-                        obj_data_keys_list.append(f"_{name}")
+                        obj_data_keys_list.append(f"{name}_")
+                self.notes.append(
+                    f"Renamed data_key '{name}' to '{name}_' in stream {doc['name']}"
+                )
 
         # Rename some fields (in-place) to match the current schema for the descriptor
         # Loop over all dictionaries that specify data_keys (both event data_keys or configuration data_keys)
@@ -489,10 +492,10 @@ class RunNormalizer(DocumentRouter):
         # Rename data_keys that use reserved words, "time" and "seq_num"
         for name in RESERVED_DATA_KEYS:
             if name in doc["data"].keys():
-                doc["data"][f"_{name}"] = doc["data"].pop(name)
-                doc["timestamps"][f"_{name}"] = doc["timestamps"].pop(name)
+                doc["data"][f"{name}_"] = doc["data"].pop(name)
+                doc["timestamps"][f"{name}_"] = doc["timestamps"].pop(name)
             if name in doc.get("filled", {}).keys():
-                doc["filled"][f"_{name}"] = doc["filled"].pop(name)
+                doc["filled"][f"{name}_"] = doc["filled"].pop(name)
 
         # Part 1. ----- Internal Data -----
         # Emit a new Event with _internal_ data: select only keys without 'external' flag or those that are filled
