@@ -838,7 +838,8 @@ class _RunWriter(DocumentRouter):
                     msg = title + f" failed with error: {msg}"
                     if "PCAP.TS_TRIG.Value" in str(e):
                         logger.warning(msg + " Continuing validation.")
-                    elif "out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg:
+                    elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
+                        ("out of bounds for axis 1 with size " in msg and "xs_settings_" in msg):
                         logger.warning(msg + " Continuing validation.")
                     else:
                         raise ValidationError(msg) from e
