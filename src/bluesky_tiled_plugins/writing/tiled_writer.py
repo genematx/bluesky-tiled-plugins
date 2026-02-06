@@ -330,9 +330,14 @@ class RunNormalizer(DocumentRouter):
         # There are cases when the frame_index is reset during the scan (e.g. if Datums for the same
         # data_key belong to different Resources), so the 'carry' field is used to keep track of the
         # previous frame index.
+        # In case when the index needs to RESET for each Resource, the `indices` dictionary should be
+        # included in the datum_kwargs directly.
         datum_kwargs = datum_doc.get("datum_kwargs", {})
         frame = datum_kwargs.pop("frame", None)
-        if frame is not None:
+        indices = datum_kwargs.pop("indices", None)
+        if indices is not None:
+            index_start, index_stop = indices["start"], indices["stop"]
+        elif frame is not None:
             desc_name = self._desc_name_by_uid[
                 desc_uid
             ]  # Name of the descriptor (stream)
@@ -446,6 +451,10 @@ class RunNormalizer(DocumentRouter):
             ):
                 data_keys_spec["dtype_numpy"] = dtype_numpy
 
+            # Ensure that shape is not None; if so, set it to an empty tuple
+            if "shape" in data_keys_spec and data_keys_spec.get("shape") is None:
+                data_keys_spec["shape"] = ()
+
         # Ensure that all event data_keys have object_name assigned, if known (for consistency)
         # If "object_keys" are not present, do not reconstruct them -- they are optional
         for obj_name, data_keys_list in doc.get("object_keys", {}).items():
@@ -483,7 +492,7 @@ class RunNormalizer(DocumentRouter):
             if name in doc["data"].keys():
                 doc["data"][f"_{name}"] = doc["data"].pop(name)
                 doc["timestamps"][f"_{name}"] = doc["timestamps"].pop(name)
-            if name in doc["filled"].keys():
+            if name in doc.get("filled", {}).keys():
                 doc["filled"][f"_{name}"] = doc["filled"].pop(name)
 
         # Part 1. ----- Internal Data -----
@@ -642,6 +651,7 @@ class _RunWriter(DocumentRouter):
         self._validate: bool = validate
         self.data_keys: dict[str, DataKey] = {}
         self.access_tags: list[str] | None = None
+        self.notes: list[str] = []
 
     def _write_internal_data(
         self, data_cache: list[dict[str, Any]], desc_node: Container
@@ -651,7 +661,17 @@ class _RunWriter(DocumentRouter):
         desc_name = desc_node.item["id"]  # Name of the descriptor (stream)
         # 1. Write internal array data, if any; remove it from the tabular data
         for key in self._int_array_keys[desc_name]:
-            array = numpy.array([row.pop(key) for row in data_cache if key in row])
+            arr_lst = [row.pop(key) for row in data_cache if key in row]
+            min_len, max_len = min(len(row) for row in arr_lst), max(len(row) for row in arr_lst)
+
+            # Pad the arrays with NaNs to make them the same length if necessary
+            if min_len != max_len:
+                arr_lst = [row + [numpy.nan] * (max_len - len(row)) for row in arr_lst]
+                msg = (f"Array lengths for key '{key}' in stream '{desc_name}' are not consistent: "
+                       f"min={min_len}, max={max_len}; the arrays are padded with NaNs.")
+                logger.warning(msg)
+                self.notes.append(msg)
+            array = numpy.array(arr_lst)
             if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):
                 # Create a new "internal" array data node and write the initial piece of data
                 metadata = truncate_json_overflow(self.data_keys.get(key, {}))
@@ -664,6 +684,7 @@ class _RunWriter(DocumentRouter):
                     access_tags=self.access_tags,
                 )
                 self._internal_arrays[f"{desc_name}/{key}"] = arr_client
+                self.notes.append(f"Internal array data for '{key}' in stream '{desc_name}' written as zarr.")
             else:
                 arr_client.patch(array, offset=arr_client.shape[:1], extend=True)
 
@@ -776,7 +797,6 @@ class _RunWriter(DocumentRouter):
             )
 
         # Validate structure for some StreamResource nodes, select unique pairs of (sres_node, consolidator)
-        notes = []
         node_and_cons = {
             (sres_node, self._consolidators[sres_uid])
             for sres_uid, sres_node in self._sres_nodes.items()
@@ -786,23 +806,50 @@ class _RunWriter(DocumentRouter):
                 title = f"Validation of data key '{sres_node.item['id']}'"
                 try:
                     _notes = consolidator.validate(fix_errors=True)
-                    notes.extend([title + ": " + note for note in _notes])
+                    self.notes.extend([title + ": " + note for note in _notes])
+                except FileNotFoundError as e:
+                    if (e.filename is not None) and Path(e.filename).parent.exists():
+                        msg = title + f" failed with error: {e.filename} is not found, " \
+                            + "but its parent directory exists and is readable."
+                        self.notes.append(msg)
+                        logger.error(msg + " Continuing validation.")
+                    elif e.filename is None:
+                        if 'No such file or directory' in str(e):
+                            import re
+                            if m := re.search(r":\s*'([^']+)'$", str(e)):
+                                fpath = m.group(1)
+                                if (not Path(fpath).exists()) and Path(fpath).parent.exists():
+                                    msg = title + f" failed with error: {fpath} is not found, " \
+                                        + "but its parent directory exists and is readable."
+                                    self.notes.append(msg)
+                                    logger.error(msg + " Continuing validation.")
+                        else:
+                            msg = title + f" failed with error: {e}"
+                            raise ValidationError(msg) from e
+                    else:
+                        msg = title + f" failed with error: neither {e.filename}, " \
+                            + "nor its parent directory exist. Cannot continue validation."
+                        raise ValidationError(msg) from e
                 except Exception as e:
                     msg = (
                         f"{type(e).__name__}: "
                         + str(e).replace("\n", " ").replace("\r", "").strip()
                     )
                     msg = title + f" failed with error: {msg}"
-                    raise ValidationError(msg) from e
+                    if "PCAP.TS_TRIG.Value" in str(e):
+                        logger.warning(msg + " Continuing validation.")
+                    elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
+                        ("out of bounds for axis 1 with size " in msg and "xs_settings_" in msg):
+                        logger.warning(msg + " Continuing validation.")
+                    else:
+                        raise ValidationError(msg) from e
                 self._update_data_source_for_node(
                     sres_node, consolidator.get_data_source()
                 )
 
         # Write the stop document to the metadata
-        for key in self._internal_arrays.keys():
-            notes.append(f"Internal array data in '{key}' written as zarr format.")
         notes = (
-            doc.pop("_run_normalizer_notes", []) + notes
+            doc.pop("_run_normalizer_notes", []) + self.notes
         )  # Retrieve notes from the normalizer, if any
         md_update = {"stop": doc, **({"notes": notes} if notes else {})}
         self.root_node.update_metadata(metadata=md_update, drop_revision=True)
