@@ -334,8 +334,7 @@ class RunNormalizer(DocumentRouter):
         # included in the datum_kwargs directly.
         datum_kwargs = datum_doc.get("datum_kwargs", {})
         frame = datum_kwargs.pop("frame", None)
-        indices = datum_kwargs.pop("indices", None)
-        if indices is not None:
+        if indices := datum_kwargs.pop("indices", None):
             index_start, index_stop = indices["start"], indices["stop"]
         elif frame is not None:
             desc_name = self._desc_name_by_uid[
@@ -417,15 +416,18 @@ class RunNormalizer(DocumentRouter):
         # Rename data_keys that use reserved words, "time" and "seq_num"
         for name in RESERVED_DATA_KEYS:
             if name in doc["data_keys"].keys():
-                if f"_{name}" in doc["data_keys"].keys():
+                if f"{name}_" in doc["data_keys"].keys():
                     raise ValueError(
-                        f"Cannot rename {name} to _{name} because it already exists"
+                        f"Cannot rename {name} to {name}_ because it already exists"
                     )
-                doc["data_keys"][f"_{name}"] = doc["data_keys"].pop(name)
+                doc["data_keys"][f"{name}_"] = doc["data_keys"].pop(name)
                 for obj_data_keys_list in doc.get("object_keys", {}).values():
                     if name in obj_data_keys_list:
                         obj_data_keys_list.remove(name)
-                        obj_data_keys_list.append(f"_{name}")
+                        obj_data_keys_list.append(f"{name}_")
+                self.notes.append(
+                    f"Renamed data_key '{name}' to '{name}_' in stream {doc['name']}"
+                )
 
         # Rename some fields (in-place) to match the current schema for the descriptor
         # Loop over all dictionaries that specify data_keys (both event data_keys or configuration data_keys)
@@ -451,7 +453,7 @@ class RunNormalizer(DocumentRouter):
             ):
                 data_keys_spec["dtype_numpy"] = dtype_numpy
 
-            # Ensure that shape is not None; if so, set it to an empty tuple
+            # Ensure that shape is not None; otherwise, set it to an empty tuple
             if "shape" in data_keys_spec and data_keys_spec.get("shape") is None:
                 data_keys_spec["shape"] = ()
 
@@ -490,10 +492,10 @@ class RunNormalizer(DocumentRouter):
         # Rename data_keys that use reserved words, "time" and "seq_num"
         for name in RESERVED_DATA_KEYS:
             if name in doc["data"].keys():
-                doc["data"][f"_{name}"] = doc["data"].pop(name)
-                doc["timestamps"][f"_{name}"] = doc["timestamps"].pop(name)
+                doc["data"][f"{name}_"] = doc["data"].pop(name)
+                doc["timestamps"][f"{name}_"] = doc["timestamps"].pop(name)
             if name in doc.get("filled", {}).keys():
-                doc["filled"][f"_{name}"] = doc["filled"].pop(name)
+                doc["filled"][f"{name}_"] = doc["filled"].pop(name)
 
         # Part 1. ----- Internal Data -----
         # Emit a new Event with _internal_ data: select only keys without 'external' flag or those that are filled
@@ -662,31 +664,39 @@ class _RunWriter(DocumentRouter):
         # 1. Write internal array data, if any; remove it from the tabular data
         for key in self._int_array_keys[desc_name]:
             arr_lst = [row.pop(key) for row in data_cache if key in row]
-            min_len, max_len = min(len(row) for row in arr_lst), max(len(row) for row in arr_lst)
 
             # Pad the arrays with NaNs to make them the same length if necessary
+            min_len, max_len = (
+                min(len(row) for row in arr_lst),
+                max(len(row) for row in arr_lst),
+            )
             if min_len != max_len:
                 arr_lst = [row + [numpy.nan] * (max_len - len(row)) for row in arr_lst]
-                msg = (f"Array lengths for key '{key}' in stream '{desc_name}' are not consistent: "
-                       f"min={min_len}, max={max_len}; the arrays are padded with NaNs.")
+                msg = (
+                    f"Array lengths for key '{key}' in stream '{desc_name}' are not consistent: "
+                    f"min={min_len}, max={max_len}; the arrays are padded with NaNs."
+                )
                 logger.warning(msg)
                 self.notes.append(msg)
-            array = numpy.array(arr_lst)
+
+            # Create a new "internal" array data node or update the existing one
             if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):
-                # Create a new "internal" array data node and write the initial piece of data
                 metadata = truncate_json_overflow(self.data_keys.get(key, {}))
-                dims = ("time",) + tuple(f"dim_{i}" for i in range(1, array.ndim))
                 arr_client = desc_node.write_array(
-                    array,
+                    numpy.array(arr_lst),
                     key=key,
                     metadata=metadata,
-                    dims=dims,
+                    dims=("time", "dim_1"),  # Always 2D
                     access_tags=self.access_tags,
                 )
                 self._internal_arrays[f"{desc_name}/{key}"] = arr_client
-                self.notes.append(f"Internal array data for '{key}' in stream '{desc_name}' written as zarr.")
+                self.notes.append(
+                    f"Internal array data for '{key}' in stream '{desc_name}' written as zarr."
+                )
             else:
-                arr_client.patch(array, offset=arr_client.shape[:1], extend=True)
+                arr_client.patch(
+                    numpy.array(arr_lst), offset=arr_client.shape[:1], extend=True
+                )
 
         # 2. Write internal tabular data; all data_keys for arrays have been removed from data_cache on step 1
         if not (table := pyarrow.Table.from_pylist(data_cache)):
@@ -847,10 +857,8 @@ class _RunWriter(DocumentRouter):
                     sres_node, consolidator.get_data_source()
                 )
 
-        # Write the stop document to the metadata
-        notes = (
-            doc.pop("_run_normalizer_notes", []) + self.notes
-        )  # Retrieve notes from the normalizer, if any
+        # Write the stop document to the metadata, include notes from the normalizer, if any
+        notes = doc.pop("_run_normalizer_notes", []) + self.notes
         md_update = {"stop": doc, **({"notes": notes} if notes else {})}
         self.root_node.update_metadata(metadata=md_update, drop_revision=True)
 

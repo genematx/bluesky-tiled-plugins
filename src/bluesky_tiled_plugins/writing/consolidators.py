@@ -39,6 +39,13 @@ def list_summands(A: int, b: int, repeat: int = 1) -> tuple[int, ...]:
     return tuple([b] * (A // b) + ([A % b] if A % b > 0 else [])) * repeat or (0,)
 
 
+def list_summands(A: int, b: int, repeat: int = 1) -> tuple[int, ...]:
+    # Generate a list with repeated b summing up to A; append the remainder if necessary
+    # e.g. list_summands(13, 3) = [3, 3, 3, 3, 1]
+    # if `repeat = n`, n > 1, copy and repeat the entire result n times
+    return tuple([b] * (A // b) + ([A % b] if A % b > 0 else [])) * repeat or (0,)
+
+
 @dataclasses.dataclass
 class Patch:
     shape: tuple[int, ...]
@@ -445,7 +452,7 @@ class ConsolidatorBase:
                     ("time",)
                     + old_dims
                     + tuple(
-                        f"dim{i}"
+                        f"dim_{i}"
                         for i in range(len(old_dims) + 1, len(structure.shape))
                     )
                 )
@@ -723,23 +730,24 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
             )
 
         # Compile and set the filename template
-        self.template = self._compile_template(self._sres_parameters["template"],
-                        self._sres_parameters.get("filename", ""))
+        self.template = self._compile_template(
+            self._sres_parameters["template"], self._sres_parameters.get("filename", "")
+        )
 
     @staticmethod
     def _compile_template(template: str, filename: str = "") -> str:
         """Compile a filename template from old-style to new-style Python formatting
 
-            Parameters
-            ----------
-            template : str
-                An old-style Python formatting string, e.g. "%s%s_%06d.tif
-            filename : str
-                An optional filename to substitute for the first %s in the template.
+        Parameters
+        ----------
+        template : str
+            An old-style Python formatting string, e.g. "%s%s_%06d.tif
+        filename : str
+            An optional filename to substitute for the first %s in the template.
 
-            Returns
-            -------
-                A new-style Python formatting string, e.g. "filename_{:06d}.tif"
+        Returns
+        -------
+            A new-style Python formatting string, e.g. "filename_{:06d}.tif"
         """
 
         def int_replacer(match):
@@ -841,8 +849,9 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         """Add an Asset for a new StreamResource document"""
 
         self._sres_parameters = stream_resource["parameters"]
-        self.template = self._compile_template(self._sres_parameters["template"],
-            self._sres_parameters.get("filename", ""))
+        self.template = self._compile_template(
+            self._sres_parameters["template"], self._sres_parameters.get("filename", "")
+        )
 
 
 class TIFFConsolidator(MultipartRelatedConsolidator):
