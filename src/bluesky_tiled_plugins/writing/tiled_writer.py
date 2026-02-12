@@ -283,21 +283,24 @@ class RunNormalizer(DocumentRouter):
                 "/"
             )
 
-        # Set default parameters (resource_kwargs) to encode the logic in corresponding handlers.
-        # If the parameters already present in the document, they take precedence over the defaults.
-        if stream_resource_doc["mimetype"] == "application/x-hdf5":
-            # Ensure that the internal path within HDF5 files is referenced with "dataset" parameter
+            # Add the internal path within HDF5 files to the parameters for known Bluesky specs
+            existing_dataset = stream_resource_doc["parameters"].get("dataset")
             if resource_spec in {"AD_HDF5", "AD_HDF5_SINGLE", "AD_HDF5_SWMR", "HDF5"}:
-                default_dataset = "/entry/data/data"
+                stream_resource_doc["parameters"]["dataset"] = (
+                    existing_dataset or "/entry/data/data"
+                )
             elif resource_spec in {"XSP", "XSP3", "TPX_HDF5"}:
-                default_dataset = "/entry/instrument/detector/data"
-            else:
-                default_dataset = ""
+                stream_resource_doc["parameters"]["dataset"] = (
+                    existing_dataset or "/entry/instrument/detector/data"
+                )
+
+        # Ensure that the internal path within HDF5 files is referenced with "dataset" parameter
+        if stream_resource_doc["mimetype"] == "application/x-hdf5":
             stream_resource_doc["parameters"]["dataset"] = stream_resource_doc[
                 "parameters"
             ].pop(
                 "path",
-                stream_resource_doc["parameters"].pop("dataset", default_dataset),
+                stream_resource_doc["parameters"].pop("dataset", ""),
             )
 
         # Ensure that only the necessary fields are present in the StreamResource document
