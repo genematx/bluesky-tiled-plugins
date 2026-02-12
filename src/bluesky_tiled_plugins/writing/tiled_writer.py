@@ -817,13 +817,42 @@ class _RunWriter(DocumentRouter):
                 try:
                     _notes = consolidator.validate(fix_errors=True)
                     self.notes.extend([title + ": " + note for note in _notes])
+                except FileNotFoundError as e:
+                    if (e.filename is not None) and Path(e.filename).parent.exists():
+                        msg = title + f" failed with error: {e.filename} is not found, " \
+                            + "but its parent directory exists and is readable."
+                        self.notes.append(msg)
+                        logger.error(msg + " Continuing validation.")
+                    elif e.filename is None:
+                        if 'No such file or directory' in str(e):
+                            import re
+                            if m := re.search(r":\s*'([^']+)'$", str(e)):
+                                fpath = m.group(1)
+                                if (not Path(fpath).exists()) and Path(fpath).parent.exists():
+                                    msg = title + f" failed with error: {fpath} is not found, " \
+                                        + "but its parent directory exists and is readable."
+                                    self.notes.append(msg)
+                                    logger.error(msg + " Continuing validation.")
+                        else:
+                            msg = title + f" failed with error: {e}"
+                            raise ValidationError(msg) from e
+                    else:
+                        msg = title + f" failed with error: neither {e.filename}, " \
+                            + "nor its parent directory exist. Cannot continue validation."
+                        raise ValidationError(msg) from e
                 except Exception as e:
                     msg = (
                         f"{type(e).__name__}: "
                         + str(e).replace("\n", " ").replace("\r", "").strip()
                     )
                     msg = title + f" failed with error: {msg}"
-                    raise ValidationError(msg) from e
+                    if "PCAP.TS_TRIG.Value" in str(e):
+                        logger.warning(msg + " Continuing validation.")
+                    elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
+                        ("out of bounds for axis 1 with size " in msg and "xs_settings_" in msg):
+                        logger.warning(msg + " Continuing validation.")
+                    else:
+                        raise ValidationError(msg) from e
                 self._update_data_source_for_node(
                     sres_node, consolidator.get_data_source()
                 )

@@ -10,7 +10,6 @@ from tiled.utils import safe_json_dump
 
 logger = logging.getLogger(__name__)
 
-
 class ValidationException(Exception):
     def __init__(self, message, uid=None):
         super().__init__(message)
