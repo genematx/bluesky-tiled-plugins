@@ -39,13 +39,6 @@ def list_summands(A: int, b: int, repeat: int = 1) -> tuple[int, ...]:
     return tuple([b] * (A // b) + ([A % b] if A % b > 0 else [])) * repeat or (0,)
 
 
-def list_summands(A: int, b: int, repeat: int = 1) -> tuple[int, ...]:
-    # Generate a list with repeated b summing up to A; append the remainder if necessary
-    # e.g. list_summands(13, 3) = [3, 3, 3, 3, 1]
-    # if `repeat = n`, n > 1, copy and repeat the entire result n times
-    return tuple([b] * (A // b) + ([A % b] if A % b > 0 else [])) * repeat or (0,)
-
-
 @dataclasses.dataclass
 class Patch:
     shape: tuple[int, ...]
@@ -785,14 +778,11 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
             return f"{{:{flag_str}{width_str}{precision_str}{type_char}}}"
 
         result = (
-            template
-            .replace("%s", "{:s}", 1)
+            template.replace("%s", "{:s}", 1)
             .replace("%s", "")
             .replace("{:s}", filename, 1)
         )
-        result = re.sub(
-            r"%([-+#0 ]*)(\d+)?(?:\.(\d+))?([d])", int_replacer, result
-        )
+        result = re.sub(r"%([-+#0 ]*)(\d+)?(?:\.(\d+))?([d])", int_replacer, result)
 
         return result
 
