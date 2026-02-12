@@ -75,10 +75,14 @@ JSON_TO_NUMPY_DTYPE = {
 MIMETYPE_LOOKUP = defaultdict(
     lambda: "application/octet-stream",
     {
-        "hdf5": "application/x-hdf5",
+        "HDF5": "application/x-hdf5",
+        "AD_HDF5": "application/x-hdf5",
+        "AD_HDF5_SINGLE": "application/x-hdf5",
+        "AD_HDF5_SWMR": "application/x-hdf5",
         "AD_HDF5_SWMR_STREAM": "application/x-hdf5",
         "AD_HDF5_SWMR_SLICE": "application/x-hdf5",
         "PIL100k_HDF5": "application/x-hdf5",
+        "XSP": "application/x-hdf5",
         "XSP3": "application/x-hdf5",
         "XPS3": "application/x-hdf5",
         "XSP3_BULK": "application/x-hdf5",
@@ -269,9 +273,8 @@ class RunNormalizer(DocumentRouter):
 
             # Convert the Resource (or old StreamResource) document to a StreamResource document
             resource_dict = cast("dict", doc)
-            stream_resource_doc["mimetype"] = self.spec_to_mimetype[
-                resource_dict.pop("spec")
-            ]
+            resource_spec = resource_dict.pop("spec")
+            stream_resource_doc["mimetype"] = self.spec_to_mimetype[resource_spec]
             stream_resource_doc["parameters"] = resource_dict.pop("resource_kwargs", {})
             file_path = Path(resource_dict.pop("root").strip("/")).joinpath(
                 resource_dict.pop("resource_path").strip("/")
@@ -280,11 +283,22 @@ class RunNormalizer(DocumentRouter):
                 "/"
             )
 
-        # Ensure that the internal path within HDF5 files is referenced with "dataset" parameter
+        # Set default parameters (resource_kwargs) to encode the logic in corresponding handlers.
+        # If the parameters already present in the document, they take precedence over the defaults.
         if stream_resource_doc["mimetype"] == "application/x-hdf5":
+            # Ensure that the internal path within HDF5 files is referenced with "dataset" parameter
+            if resource_spec in {"AD_HDF5", "AD_HDF5_SINGLE", "AD_HDF5_SWMR", "HDF5"}:
+                default_dataset = "/entry/data/data"
+            elif resource_spec in {"XSP", "XSP3", "TPX_HDF5"}:
+                default_dataset = "/entry/instrument/detector/data"
+            else:
+                default_dataset = ""
             stream_resource_doc["parameters"]["dataset"] = stream_resource_doc[
                 "parameters"
-            ].pop("path", stream_resource_doc["parameters"].pop("dataset", ""))
+            ].pop(
+                "path",
+                stream_resource_doc["parameters"].pop("dataset", default_dataset),
+            )
 
         # Ensure that only the necessary fields are present in the StreamResource document
         stream_resource_doc["data_key"] = stream_resource_doc.get("data_key", "")
@@ -543,7 +557,8 @@ class RunNormalizer(DocumentRouter):
             doc = patch(doc)
 
         # Keep a reference to the spec of this Resource, if present
-        self._specs_by_resource_uid[doc["uid"]] = doc.get("spec")
+        doc["spec"] = doc.get("spec", "").upper()
+        self._specs_by_resource_uid[doc["uid"]] = doc["spec"]
 
         # Convert the Resource document to StreamResource format
         self._sres_cache[doc["uid"]] = self._convert_resource_to_stream_resource(doc)
