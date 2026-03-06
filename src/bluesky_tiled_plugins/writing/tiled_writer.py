@@ -3,6 +3,7 @@ import itertools
 import logging
 from collections import defaultdict, deque, namedtuple
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
 
@@ -39,6 +40,7 @@ from tiled.client.dataframe import DataFrameClient
 from tiled.client.utils import handle_error, retry_context
 from tiled.structures.core import Spec
 from tiled.utils import safe_json_dump
+from packaging.version import Version
 
 from ..utils import truncate_json_overflow
 from ._dispatcher import Dispatcher
@@ -763,6 +765,14 @@ class _RunWriter(DocumentRouter):
         data_source.id = node.data_sources()[
             0
         ].id  # ID of the existing DataSource record
+
+        # Backompatibility: if the server is older than 0.2.4,
+        # it can not accept the "properties" field in the data source.
+        # This can be removed in later releases.
+        if Version(node.context.server_info.library_version) < Version("0.2.4"):
+            data_source = {
+                k: v for k, v in asdict(data_source).items() if k != "properties"
+            }
 
         for attempt in retry_context():
             with attempt:
