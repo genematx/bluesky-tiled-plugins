@@ -3,6 +3,7 @@ import itertools
 import logging
 from collections import defaultdict, deque, namedtuple
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
 
@@ -39,6 +40,7 @@ from tiled.client.dataframe import DataFrameClient
 from tiled.client.utils import handle_error, retry_context
 from tiled.structures.core import Spec
 from tiled.utils import safe_json_dump
+from packaging.version import Version
 
 from ..utils import truncate_json_overflow
 from ._dispatcher import Dispatcher
@@ -75,10 +77,14 @@ JSON_TO_NUMPY_DTYPE = {
 MIMETYPE_LOOKUP = defaultdict(
     lambda: "application/octet-stream",
     {
-        "hdf5": "application/x-hdf5",
+        "HDF5": "application/x-hdf5",
+        "AD_HDF5": "application/x-hdf5",
+        "AD_HDF5_SINGLE": "application/x-hdf5",
+        "AD_HDF5_SWMR": "application/x-hdf5",
         "AD_HDF5_SWMR_STREAM": "application/x-hdf5",
         "AD_HDF5_SWMR_SLICE": "application/x-hdf5",
         "PIL100k_HDF5": "application/x-hdf5",
+        "XSP": "application/x-hdf5",
         "XSP3": "application/x-hdf5",
         "XPS3": "application/x-hdf5",
         "XSP3_BULK": "application/x-hdf5",
@@ -269,9 +275,8 @@ class RunNormalizer(DocumentRouter):
 
             # Convert the Resource (or old StreamResource) document to a StreamResource document
             resource_dict = cast("dict", doc)
-            stream_resource_doc["mimetype"] = self.spec_to_mimetype[
-                resource_dict.pop("spec")
-            ]
+            resource_spec = resource_dict.pop("spec")
+            stream_resource_doc["mimetype"] = self.spec_to_mimetype[resource_spec]
             stream_resource_doc["parameters"] = resource_dict.pop("resource_kwargs", {})
             file_path = Path(resource_dict.pop("root").strip("/")).joinpath(
                 resource_dict.pop("resource_path").strip("/")
@@ -280,11 +285,25 @@ class RunNormalizer(DocumentRouter):
                 "/"
             )
 
+            # Add the internal path within HDF5 files to the parameters for known Bluesky specs
+            existing_dataset = stream_resource_doc["parameters"].get("dataset")
+            if resource_spec in {"AD_HDF5", "AD_HDF5_SINGLE", "AD_HDF5_SWMR", "HDF5"}:
+                stream_resource_doc["parameters"]["dataset"] = (
+                    existing_dataset or "/entry/data/data"
+                )
+            elif resource_spec in {"XSP", "XSP3", "TPX_HDF5"}:
+                stream_resource_doc["parameters"]["dataset"] = (
+                    existing_dataset or "/entry/instrument/detector/data"
+                )
+
         # Ensure that the internal path within HDF5 files is referenced with "dataset" parameter
         if stream_resource_doc["mimetype"] == "application/x-hdf5":
             stream_resource_doc["parameters"]["dataset"] = stream_resource_doc[
                 "parameters"
-            ].pop("path", stream_resource_doc["parameters"].pop("dataset", ""))
+            ].pop(
+                "path",
+                stream_resource_doc["parameters"].pop("dataset", ""),
+            )
 
         # Ensure that only the necessary fields are present in the StreamResource document
         stream_resource_doc["data_key"] = stream_resource_doc.get("data_key", "")
@@ -543,7 +562,8 @@ class RunNormalizer(DocumentRouter):
             doc = patch(doc)
 
         # Keep a reference to the spec of this Resource, if present
-        self._specs_by_resource_uid[doc["uid"]] = doc.get("spec")
+        doc["spec"] = doc.get("spec", "").upper()
+        self._specs_by_resource_uid[doc["uid"]] = doc["spec"]
 
         # Convert the Resource document to StreamResource format
         self._sres_cache[doc["uid"]] = self._convert_resource_to_stream_resource(doc)
@@ -746,6 +766,14 @@ class _RunWriter(DocumentRouter):
             0
         ].id  # ID of the existing DataSource record
 
+        # Backompatibility: if the server is older than 0.2.4,
+        # it can not accept the "properties" field in the data source.
+        # This can be removed in later releases.
+        if Version(node.context.server_info.library_version) < Version("0.2.4"):
+            data_source = {
+                k: v for k, v in asdict(data_source).items() if k != "properties"
+            }
+
         for attempt in retry_context():
             with attempt:
                 response = node.context.http_client.put(
@@ -817,13 +845,42 @@ class _RunWriter(DocumentRouter):
                 try:
                     _notes = consolidator.validate(fix_errors=True)
                     self.notes.extend([title + ": " + note for note in _notes])
+                except FileNotFoundError as e:
+                    if (e.filename is not None) and Path(e.filename).parent.exists():
+                        msg = title + f" failed with error: {e.filename} is not found, " \
+                            + "but its parent directory exists and is readable."
+                        self.notes.append(msg)
+                        logger.error(msg + " Continuing validation.")
+                    elif e.filename is None:
+                        if 'No such file or directory' in str(e):
+                            import re
+                            if m := re.search(r":\s*'([^']+)'$", str(e)):
+                                fpath = m.group(1)
+                                if (not Path(fpath).exists()) and Path(fpath).parent.exists():
+                                    msg = title + f" failed with error: {fpath} is not found, " \
+                                        + "but its parent directory exists and is readable."
+                                    self.notes.append(msg)
+                                    logger.error(msg + " Continuing validation.")
+                        else:
+                            msg = title + f" failed with error: {e}"
+                            raise ValidationError(msg) from e
+                    else:
+                        msg = title + f" failed with error: neither {e.filename}, " \
+                            + "nor its parent directory exist. Cannot continue validation."
+                        raise ValidationError(msg) from e
                 except Exception as e:
                     msg = (
                         f"{type(e).__name__}: "
                         + str(e).replace("\n", " ").replace("\r", "").strip()
                     )
                     msg = title + f" failed with error: {msg}"
-                    raise ValidationError(msg) from e
+                    if "PCAP.TS_TRIG.Value" in str(e):
+                        logger.warning(msg + " Continuing validation.")
+                    elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
+                        ("out of bounds for axis 1 with size " in msg and "xs_settings_" in msg):
+                        logger.warning(msg + " Continuing validation.")
+                    else:
+                        raise ValidationError(msg) from e
                 self._update_data_source_for_node(
                     sres_node, consolidator.get_data_source()
                 )

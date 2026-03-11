@@ -1,9 +1,12 @@
 import collections
 import dataclasses
+import importlib
+import math
 import os
 import re
 import warnings
 from typing import Literal, cast
+from pathlib import Path
 
 import numpy as np
 from event_model.documents import EventDescriptor, StreamDatum, StreamResource
@@ -11,6 +14,22 @@ from tiled.mimetypes import DEFAULT_ADAPTERS_BY_MIMETYPE
 from tiled.structures.array import ArrayStructure, BuiltinDtype, StructDtype
 from tiled.structures.core import StructureFamily
 from tiled.structures.data_source import Asset, DataSource, Management
+from tiled.utils import OneShotCachedMap, path_from_uri, ensure_uri
+
+# User-provided adapters take precedence over defaults.
+CUSTOM_ADAPTERS_BY_MIMETYPE = OneShotCachedMap[str, type](
+    {
+        "application/x-pizzabox-binary": lambda: importlib.import_module(
+            "mng2sql.adapters.pizzabox", __name__
+        ).PizzaBoxAdapter,
+        "application/x-hdf5;type=xia-xmap": lambda: importlib.import_module(
+            "mng2sql.adapters.xiaxmap", __name__
+        ).XIAxMAPAdapter,
+    }
+)
+DEFAULT_ADAPTERS_BY_MIMETYPE = collections.ChainMap(
+    CUSTOM_ADAPTERS_BY_MIMETYPE, DEFAULT_ADAPTERS_BY_MIMETYPE
+)
 
 
 def list_summands(A: int, b: int, repeat: int = 1) -> tuple[int, ...]:
@@ -111,9 +130,17 @@ class ConsolidatorBase:
 
         self.data_key = stream_resource["data_key"]
         self.uri = stream_resource["uri"]
-        self.assets: list[Asset] = [
-            Asset(data_uri=self.uri, is_directory=False, parameter="data_uris", num=0)
-        ]
+        if (stream_resource["parameters"].get("_resource_spec") == 'AD_EIGER_MX') \
+            and (stream_resource["parameters"].get("data_key") == "data"):
+            self.assets: list[Asset] = [
+            Asset(data_uri=self.uri, is_directory=False, parameter="master")
+            ]
+        elif self.mimetype in {"image/jpeg", "image/tiff"}:
+            self.assets: list[Asset] = [Asset(data_uri=self.uri, is_directory=False, parameter="data_uri")]
+        else:
+            self.assets: list[Asset] = [
+                Asset(data_uri=self.uri, is_directory=False, parameter="data_uris", num=0)
+            ]
         self._sres_parameters = stream_resource["parameters"]
 
         # Find datum shape and machine dtype
@@ -351,6 +378,13 @@ class ConsolidatorBase:
         # Initialize adapter from uris and determine the structure
         adapter_class = DEFAULT_ADAPTERS_BY_MIMETYPE[self.mimetype]
         uris = [asset.data_uri for asset in self.assets]
+
+        # Check that the files exist
+        for uri in uris:
+            fpath = Path(path_from_uri(uri))
+            if not fpath.exists() or (fpath.is_file() and fpath.stat().st_size == 0):
+                raise FileNotFoundError(2, "No such file or directory or it is empty", str(fpath))
+
         structure = adapter_class.from_uris(
             *uris, **self.adapter_parameters()
         ).structure()
@@ -461,9 +495,134 @@ class CSVConsolidator(ConsolidatorBase):
             if k in allowed_keys
         }
 
+    def validate(self, fix_errors=False) -> list[str]:
+        # CSVConsolidator needs special handling to validate the structure when the data_type is StructDtype.
+        # In this case, we need to check that the number of columns, their names and dtypes match.
+        # The shape and chunks are also validated.
+        # If data_type is BuiltinDtype, we can rely on the base class implementation.
+
+        if isinstance(self.data_type, StructDtype):
+            from tiled.adapters.csv import CSVAdapter
+            import pyarrow.types as patypes
+
+            uris = [asset.data_uri for asset in self.assets]
+            adapter = CSVAdapter.from_uris(
+                uris[0], **self.adapter_parameters()
+            )  # Initialize from the first file
+            column_dtypes = adapter.structure().arrow_schema_decoded.types
+            notes = []
+
+            if len(column_dtypes) != len(self.data_type.fields):
+                raise ValueError(
+                    f"Number of columns mismatch: {len(column_dtypes)} != {len(self.data_type.fields)}"
+                )
+
+            # Construct the true StructDtype of the data as read by the adapter
+            true_column_names_dtypes = []
+            for indx, expected, true_column_dtype in zip(range(len(self.data_type.fields)), self.data_type.fields, column_dtypes):
+                if patypes.is_string(true_column_dtype) or patypes.is_large_string(true_column_dtype):
+                    _true_dtype = np.array([str(x) for x in adapter.read(indx)]).dtype   # becomes "<Un" dtype
+                else:
+                    _true_dtype = true_column_dtype.to_pandas_dtype()
+                true_column_names_dtypes.append((expected.name, _true_dtype))
+
+            true_numpy_dtype = np.dtype(true_column_names_dtypes)
+            true_dtype = StructDtype.from_numpy_dtype(true_numpy_dtype)
+
+            if self.data_type != true_dtype:
+                if not fix_errors:
+                    raise ValueError(
+                        f"dtype mismatch: {self.data_type} != {true_dtype}"
+                    )
+                else:
+                    msg = f"Fixed dtype mismatch: {self.data_type.to_numpy_dtype()} -> {true_numpy_dtype}"  # noqa
+                    warnings.warn(msg, stacklevel=2)
+                    self.data_type = true_dtype
+                    notes.append(msg)
+
+            # Get the shape and chunk shape by reading the first column of the CSV file
+            nrows, npartitions = len(adapter.read([0])), adapter.structure().npartitions
+            dim0_chunks = list_summands(nrows, math.ceil(nrows / npartitions))
+            # If there are multiple files, add their chunks as well
+            for uri in uris[1:]:
+                adapter = CSVAdapter.from_uris(uri, **self.adapter_parameters())
+                nrows, npartitions = (
+                    len(adapter.read([0])),
+                    adapter.structure().npartitions,
+                )
+                dim0_chunks = (
+                    *dim0_chunks,
+                    *list_summands(nrows, math.ceil(nrows / npartitions)),
+                )
+            # Determine the true shape and chunks for the entire dataset
+            true_shape, true_chunks = (sum(dim0_chunks), 1), (dim0_chunks, (1,))
+
+            if self.shape != true_shape:
+                if not fix_errors:
+                    raise ValueError(f"Shape mismatch: {self.shape} != {true_shape}")
+                else:
+                    msg = f"Fixed shape mismatch: {self.shape} -> {true_shape}"
+                    warnings.warn(msg, stacklevel=2)
+                    self._num_rows = true_shape[0]
+                    self.datum_shape = (1, 1) if self.join_method == "concat" else (1,)
+                    notes.append(msg)
+
+            if self.chunks != true_chunks:
+                if not fix_errors:
+                    raise ValueError(
+                        f"Chunk shape mismatch: {self.chunks} != {true_chunks}"
+                    )
+                else:
+                    if len(true_chunks[0]) == 1 or (
+                        len(set(true_chunks[0][:-1])) == 1
+                        and (true_chunks[0][-1] <= true_chunks[0][0])
+                    ):
+                        # Either single chunk or all chunks except possibly the last one are the same (larger) size
+                        _chunk_shape = tuple(c[0] for c in true_chunks)
+                        msg = f"Fixed chunk shape mismatch: {self.chunk_shape} -> {_chunk_shape}"
+                        warnings.warn(msg, stacklevel=2)
+                        self.chunk_shape = _chunk_shape
+                        self.join_chunks = True
+                        notes.append(msg)
+                    else:
+                        msg = f"Fixed chunk shape mismatch along the leading dimension: {true_chunks[0]}"
+                        warnings.warn(msg, stacklevel=2)
+                        self.chunks = true_chunks
+                        notes.append(msg)
+
+            if self.dims and (len(self.dims) != len(true_shape)):
+                if not fix_errors:
+                    raise ValueError(
+                        "Number of dimension names mismatch for a "
+                        f"{len(true_shape)}-dimensional array: {self.dims}"
+                    )
+                else:
+                    old_dims = self.dims
+                    if len(old_dims) < len(true_shape):
+                        self.dims = (
+                            ("time",)
+                            + old_dims
+                            + tuple(
+                                f"dim{i}"
+                                for i in range(len(old_dims) + 1, len(true_shape))
+                            )
+                        )
+                    else:
+                        self.dims = old_dims[: len(true_shape)]
+                    msg = f"Fixed dimension names: {old_dims} -> {self.dims}"
+                    warnings.warn(msg, stacklevel=2)
+                    notes.append(msg)
+
+            assert self.get_adapter() is not None, "Adapter can not be initialized"
+
+        else:
+            notes = super().validate(fix_errors=fix_errors)
+
+        return notes
+
 
 class HDF5Consolidator(ConsolidatorBase):
-    supported_mimetypes = {"application/x-hdf5"}
+    supported_mimetypes = {"application/x-hdf5", "application/x-hdf5;type=xia-xmap"}
 
     def adapter_parameters(self) -> dict:
         """Parameters to be passed to the HDF5 adapter, a dictionary with the keys:
@@ -503,6 +662,45 @@ class HDF5Consolidator(ConsolidatorBase):
         )
         self.assets.append(asset)
 
+    def validate(self, fix_errors=False) -> list[str]:
+        if (self._sres_parameters.get("_resource_spec") == 'AD_EIGER_MX') \
+            and (self._sres_parameters.get("data_key") == "data"):
+            # Special handling for NexusMX HDF5 files where data is stored in several linked files
+            if len(self.assets) != 1:
+                raise ValueError("NexusMX HDF5 dataset must be referenced by a single master file.")
+            master_uri = self.assets[0].data_uri
+            master_fpath = path_from_uri(master_uri)
+            self.assets.clear()
+
+            # Repopulate assets based on the linked files
+            import h5py
+
+            with h5py.File(master_fpath, 'r') as f:
+                for i, key in enumerate(f['/entry/data'].keys()):
+                    link = f['/entry/data'].get(key, getlink=True)
+                    self.assets.append(
+                        Asset(
+                            data_uri=ensure_uri(master_fpath.with_name(link.filename)),
+                            is_directory=False,
+                            parameter="data_uris",
+                            num=i,
+                        )
+                    )
+                    self._sres_parameters['dataset'] = link.path  # assume all links point to the same dataset path
+        
+            # Proceed with usual validation
+            notes = super().validate(fix_errors=fix_errors)
+
+            # Keep the master file as a separate asset
+            self.assets.append(Asset(data_uri=master_uri, is_directory=False, parameter="master"))
+
+            msg = "Added linked files to the set of assets."
+            warnings.warn(msg, stacklevel=2)
+            notes.append(msg)
+        else:
+            notes = super().validate(fix_errors=fix_errors)
+
+        return notes
 
 class MultipartRelatedConsolidator(ConsolidatorBase):
     def __init__(
@@ -679,6 +877,35 @@ class NPYConsolidator(MultipartRelatedConsolidator):
         super().__init__({".npy"}, stream_resource, descriptor)
 
 
+class PizzaBoxConsolidator(ConsolidatorBase):
+    supported_mimetypes: set[str] = {"application/x-pizzabox-binary"}
+
+    def validate(self, fix_errors=False) -> list[str]:
+        notes = super().validate(fix_errors=fix_errors)
+
+        # Initialize adapter from uris and try to locate missing files
+        adapter_class = DEFAULT_ADAPTERS_BY_MIMETYPE[self.mimetype]
+        uris = [asset.data_uri for asset in self.assets]
+        uri_bin, uri_txt = adapter_class.locate_files(*uris)
+
+        if uri_txt and uris == [uri_bin]:
+            if not fix_errors:
+                raise ValueError(
+                    f"Missing asset for PizzaBox binary metadata file: {uri_txt}"
+                )
+            else:
+                self.assets.append(
+                    Asset(data_uri=uri_txt, is_directory=False, parameter="metadata")
+                )
+                msg = f"Registered missing asset for PizzaBox binary metadata file: {uri_txt.split('/')[-1]}"
+                warnings.warn(msg, stacklevel=2)
+                notes.append(msg)
+
+        assert self.init_adapter() is not None, "Adapter can not be initialized"
+
+        return notes
+
+
 CONSOLIDATOR_REGISTRY = collections.defaultdict(
     lambda: ConsolidatorBase,
     {
@@ -687,6 +914,7 @@ CONSOLIDATOR_REGISTRY = collections.defaultdict(
         "multipart/related;type=image/tiff": TIFFConsolidator,
         "multipart/related;type=image/jpeg": JPEGConsolidator,
         "multipart/related;type=application/x-npy": NPYConsolidator,
+        "application/x-pizzabox-binary": PizzaBoxConsolidator,
     },
 )
 
