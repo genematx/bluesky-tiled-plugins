@@ -685,8 +685,7 @@ def test_empty_tiled_writer(client, external_assets_folder, fname):
     assert len(run) == 0  # No subcontainers should be created
 
     # Check the metadata of the run
-    assert "start" in run.metadata
-    assert "stop" in run.metadata
+    assert set(run.metadata.keys()) == {"start", "stop"}
     assert "time" in run.start
     assert "scan_id" in run.start
     assert "plan_args" not in run.start
