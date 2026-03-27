@@ -26,6 +26,9 @@ CUSTOM_ADAPTERS_BY_MIMETYPE = OneShotCachedMap[str, type](
         "application/x-hdf5;type=xia-xmap": lambda: importlib.import_module(
             "mng2sql.adapters.xiaxmap", __name__
         ).XIAxMAPAdapter,
+        "application/x-hdf5;type=eiger-mx": lambda: importlib.import_module(
+            "mng2sql.adapters.eigermx", __name__
+        ).EigerMXAdapter,
     }
 )
 DEFAULT_ADAPTERS_BY_MIMETYPE = collections.ChainMap(
