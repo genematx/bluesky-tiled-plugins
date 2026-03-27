@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
+import warnings
 
 import httpx
 import numpy
@@ -855,17 +856,19 @@ class _RunWriter(DocumentRouter):
                 with attempt:
                     response = self.root_node.context.http_client.get(
                         self.root_node.uri.replace("/metadata/", "/validate/", 1),
-                        params={"fix": ",".join(map(str, patch.shape))},
+                        params={"fix_errors": True},
                     )
+
             try:
                 content = handle_error(response).json()
+                _notes = content.get("notes", [])
                 if content.get("valid"):
                     logger.info("Remote validation successful for all external data.")
-                    self.notes.extend(content.get("notes", []))
+                    self.notes.extend(_notes)
+                    for note in _notes:
+                        warnings.warn(note, stacklevel=2)
                 else:
-                    msg = "Remote validation failed: " + "; ".join(
-                        content.get("notes", [])
-                    )
+                    msg = "Remote validation failed: " + "; ".join(_notes)
                     raise ValidationError(msg)
 
             except httpx.HTTPStatusError as e:

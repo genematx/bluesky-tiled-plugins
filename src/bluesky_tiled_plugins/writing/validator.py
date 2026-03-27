@@ -10,6 +10,8 @@ from tiled.client.dataframe import DataFrameClient
 from tiled.client.utils import handle_error, retry_context
 from tiled.mimetypes import DEFAULT_ADAPTERS_BY_MIMETYPE as ADAPTERS_BY_MIMETYPE
 from tiled.utils import safe_json_dump
+from tiled.structures.core import STRUCTURE_TYPES
+from tiled.structures.data_source import DataSource
 from ..utils import list_summands
 
 
@@ -188,7 +190,9 @@ def validate_reading(data_client, ignore_errors=[]):
         )
 
 
-def validate_data_source(data_source, fix_errors=False, metadata=None) -> list[str]:
+def validate_data_source(
+    data_source, fix_errors=False, metadata=None
+) -> tuple[DataSource, list[str]]:
     """Validate and optionally fix the structure of a data_source, server-side
 
     Parameters
@@ -207,6 +211,9 @@ def validate_data_source(data_source, fix_errors=False, metadata=None) -> list[s
 
     data_source = copy.deepcopy(data_source)
     structure = data_source.structure
+    if isinstance(structure, dict):
+        structure = STRUCTURE_TYPES[data_source.structure_family].from_json(structure)
+        data_source.structure = structure
     notes = []
 
     # Initialize adapter from uris and determine the structure as read by the adapter
@@ -305,14 +312,11 @@ def validate_structure(data_client, fix_errors=False) -> list[str]:
             A list of human-readable notes describing any fixes applied during validation.
     """
 
-    try:
-        valid_data_source, notes = validate_data_source(
-            data_source=data_client.data_sources()[0],
-            fix_errors=fix_errors,
-            metadata=data_client.metadata,
-        )
-    except StructureValidationException as e:
-        return [f"Structure validation error: {e}"]
+    valid_data_source, notes = validate_data_source(
+        data_source=data_client.data_sources()[0],
+        fix_errors=fix_errors,
+        metadata=data_client.metadata,
+    )
 
     # Update the data source on the server if any fixes were applied
     if notes:
@@ -333,5 +337,6 @@ def validate_structure(data_client, fix_errors=False) -> list[str]:
                     content=safe_json_dump({"data_source": valid_data_source}),
                 )
         handle_error(response)
+        data_client.refresh()
 
     return notes
