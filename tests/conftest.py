@@ -8,6 +8,11 @@ import copy
 import tifffile as tf
 import numpy as np
 from bluesky_tiled_plugins.exporters import json_seq_exporter
+from tiled.server.app import build_app
+from tiled.media_type_registration import default_serialization_registry
+import tiled.catalog
+import tiled.client
+from bluesky_tiled_plugins.routers.validator import router as validator_router
 
 rng = np.random.default_rng(12345)
 
@@ -34,9 +39,8 @@ def RE(request):
 
 @pytest.fixture(scope="module")
 def catalog(tmp_path_factory):
-    tiled_catalog = pytest.importorskip("tiled.catalog")
     tmp_path = tmp_path_factory.mktemp("tiled_catalog")
-    return tiled_catalog.in_memory(
+    return tiled.catalog.in_memory(
         writable_storage={
             "filesystem": str(tmp_path),
             "sql": f"duckdb:///{tmp_path}/test.db",
@@ -45,32 +49,27 @@ def catalog(tmp_path_factory):
     )
 
 
-@pytest.fixture(scope="module")
-def app(catalog):
-    tsa = pytest.importorskip("tiled.server.app")
-    default_serialization_registry = pytest.importorskip(
-        "tiled.media_type_registration"
-    ).default_serialization_registry
-
+@pytest.fixture(scope="module", params=[{}, {"include_routers": [validator_router]}])
+def app(catalog, request):
     serialization_registry = copy.deepcopy(default_serialization_registry)
     serialization_registry.register(
         "BlueskyRun", "application/json-seq", json_seq_exporter
     )
 
-    return tsa.build_app(catalog, serialization_registry=serialization_registry)
+    return build_app(
+        catalog, serialization_registry=serialization_registry, **request.param
+    )
 
 
 @pytest.fixture(scope="module")
 def context(app):
-    tc = pytest.importorskip("tiled.client")
-    with tc.Context.from_app(app) as context:
+    with tiled.client.Context.from_app(app) as context:
         yield context
 
 
 @pytest.fixture(scope="module")
 def client(context):
-    tc = pytest.importorskip("tiled.client")
-    return tc.from_context(context)
+    return tiled.client.from_context(context)
 
 
 @pytest.fixture(scope="module")

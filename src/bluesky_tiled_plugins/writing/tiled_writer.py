@@ -6,7 +6,9 @@ from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
+import warnings
 
+import httpx
 import numpy
 import pyarrow
 from event_model import (
@@ -837,59 +839,108 @@ class _RunWriter(DocumentRouter):
                 sres_node, consolidator.get_data_source(), patch=final_patch
             )
 
-        # Update the metadata and validate structure for some StreamResource nodes
         # Select unique pairs of (sres_node, consolidator)
         node_and_cons = {
             (sres_node, self._consolidators[sres_uid])
             for sres_uid, sres_node in self._sres_nodes.items()
         }
+        # If there is any metadata on this consolidator (e.g. `frame_per_point`), update the node
         for sres_node, consolidator in node_and_cons:
-            if self._validate:
-                title = f"Validation of data key '{sres_node.item['id']}'"
-                try:
-                    _notes = consolidator.validate(fix_errors=True)
-                    self.notes.extend([title + ": " + note for note in _notes])
-                except FileNotFoundError as e:
-                    if (e.filename is not None) and Path(e.filename).parent.exists():
-                        msg = title + f" failed with error: {e.filename} is not found, " \
-                            + "but its parent directory exists and is readable."
-                        self.notes.append(msg)
-                        logger.error(msg + " Continuing validation.")
-                    elif e.filename is None:
-                        if 'No such file or directory' in str(e):
-                            import re
-                            if m := re.search(r":\s*'([^']+)'$", str(e)):
-                                fpath = m.group(1)
-                                if (not Path(fpath).exists()) and Path(fpath).parent.exists():
-                                    msg = title + f" failed with error: {fpath} is not found, " \
-                                        + "but its parent directory exists and is readable."
-                                    self.notes.append(msg)
-                                    logger.error(msg + " Continuing validation.")
-                        else:
-                            msg = title + f" failed with error: {e}"
-                            raise ValidationError(msg) from e
-                    else:
-                        msg = title + f" failed with error: neither {e.filename}, " \
-                            + "nor its parent directory exist. Cannot continue validation."
-                        raise ValidationError(msg) from e
-                except Exception as e:
-                    msg = (
-                        f"{type(e).__name__}: "
-                        + str(e).replace("\n", " ").replace("\r", "").strip()
-                    )
-                    msg = title + f" failed with error: {msg}"
-                    if "PCAP.TS_TRIG.Value" in str(e):
-                        logger.warning(msg + " Continuing validation.")
-                    elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
-                        ("out of bounds for axis 1 with size " in msg and "xs_settings_" in msg):
-                        logger.warning(msg + " Continuing validation.")
-                    else:
-                        raise ValidationError(msg) from e
-                self._update_data_source_for_node(
-                    sres_node, consolidator.get_data_source()
-                )
             if cons_md := consolidator.metadata:
                 sres_node.update_metadata(metadata=cons_md, drop_revision=True)
+
+        # Validate the Structure of the data for each external resource, if requested
+        # Try validating directly on the server, first; if endpoint is not available, do it locally
+        if self._validate:
+            for attempt in retry_context():
+                with attempt:
+                    response = self.root_node.context.http_client.get(
+                        self.root_node.uri.replace("/metadata/", "/validate/", 1),
+                        params={"fix_errors": True},
+                    )
+
+            try:
+                content = handle_error(response).json()
+                _notes = content.get("notes", [])
+                if content.get("valid"):
+                    logger.info("Remote validation successful for all external data.")
+                    self.notes.extend(_notes)
+                    for note in _notes:
+                        warnings.warn(note, stacklevel=2)
+                else:
+                    msg = "Remote validation failed: " + "; ".join(_notes)
+                    raise ValidationError(msg)
+
+            except httpx.HTTPStatusError as e:
+                # Backcompatibility: if the server does not support validation endpoint,
+                # it will return 404 Not Found error; in this case, attempt to validate
+                # the data structure locally with the Consolidator.
+
+                if response.status_code == httpx.codes.NOT_FOUND:
+                    warnings.warn(
+                        "Tiled server does not support remote validation. "
+                        "Attempting to validate the data structure locally."
+                    )
+                    for sres_node, consolidator in node_and_cons:
+                        title = f"Validation of '{sres_node.item['id']}'"
+                        try:
+                            _notes = consolidator.validate(fix_errors=True)
+                            self.notes.extend([title + ": " + note for note in _notes])
+                        except Exception as e:
+                            msg = (
+                                f"{type(e).__name__}: "
+                                + str(e).replace("\n", " ").replace("\r", "").strip()
+                            )
+                            msg = title + f" failed with error: {msg}"
+                            raise ValidationError(msg) from e
+
+                        try:
+                            _notes = consolidator.validate(fix_errors=True)
+                            self.notes.extend([title + ": " + note for note in _notes])
+                        except FileNotFoundError as e:
+                            if (e.filename is not None) and Path(e.filename).parent.exists():
+                                msg = title + f" failed with error: {e.filename} is not found, " \
+                                    + "but its parent directory exists and is readable."
+                                self.notes.append(msg)
+                                logger.error(msg + " Continuing validation.")
+                            elif e.filename is None:
+                                if 'No such file or directory' in str(e):
+                                    import re
+                                    if m := re.search(r":\s*'([^']+)'$", str(e)):
+                                        fpath = m.group(1)
+                                        if (not Path(fpath).exists()) and Path(fpath).parent.exists():
+                                            msg = title + f" failed with error: {fpath} is not found, " \
+                                                + "but its parent directory exists and is readable."
+                                            self.notes.append(msg)
+                                            logger.error(msg + " Continuing validation.")
+                                else:
+                                    msg = title + f" failed with error: {e}"
+                                    raise ValidationError(msg) from e
+                            else:
+                                msg = title + f" failed with error: neither {e.filename}, " \
+                                    + "nor its parent directory exist. Cannot continue validation."
+                                raise ValidationError(msg) from e
+                        except Exception as e:
+                            msg = (
+                                f"{type(e).__name__}: "
+                                + str(e).replace("\n", " ").replace("\r", "").strip()
+                            )
+                            msg = title + f" failed with error: {msg}"
+                            if "PCAP.TS_TRIG.Value" in str(e):
+                                logger.warning(msg + " Continuing validation.")
+                            elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
+                                ("out of bounds for axis 1 with size " in msg and "xs_settings_" in msg):
+                                logger.warning(msg + " Continuing validation.")
+                            else:
+                                raise ValidationError(msg) from e
+                        self._update_data_source_for_node(
+                            sres_node, consolidator.get_data_source()
+                        )
+
+                else:
+                    msg = "Remote validation request failed with status code "
+                    f"{response.status_code}: {response.text}"
+                    raise ValidationError(msg) from e
 
         # Write the stop document to the metadata, include notes from the normalizer, if any
         notes = doc.pop("_run_normalizer_notes", []) + self.notes

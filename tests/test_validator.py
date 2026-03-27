@@ -10,6 +10,7 @@ from bluesky_tiled_plugins.writing.validator import (
     validate_structure,
     validate,
     ReadingValidationException,
+    StructureValidationException,
 )
 
 
@@ -36,7 +37,7 @@ def test_validate_structure_shape(client, external_assets_folder):
     assert isinstance(array_client, ArrayClient)
 
     # Try validating the structure
-    with pytest.raises(ValueError, match="Shape mismatch"):
+    with pytest.raises(StructureValidationException, match="Shape mismatch"):
         validate_structure(array_client, fix_errors=False)
 
     # Now validate and fix the error
@@ -69,7 +70,7 @@ def test_validate_structure_chunks(client, external_assets_folder):
     assert isinstance(array_client, ArrayClient)
 
     # Try validating the structure
-    with pytest.raises(ValueError, match="Chunk shape mismatch"):
+    with pytest.raises(StructureValidationException, match="Chunk shape mismatch"):
         validate_structure(array_client, fix_errors=False)
 
     # Now validate and fix the error
@@ -104,7 +105,7 @@ def test_validate_structure_dtype(client, external_assets_folder):
     assert isinstance(array_client, ArrayClient)
 
     # Try validating the structure
-    with pytest.raises(ValueError, match="Data type mismatch"):
+    with pytest.raises(StructureValidationException, match="Data type mismatch"):
         validate_structure(array_client, fix_errors=False)
 
     # Now validate and fix the error
@@ -227,7 +228,7 @@ def test_validate_bluesky_run_failure(client, external_assets_folder):
         tw(name, doc)  # Write the document
 
     # Run the full validation, which should fail/raise
-    with pytest.raises(ValueError, match="Shape mismatch"):
+    with pytest.raises(StructureValidationException, match="Shape mismatch"):
         validate(client[uid], fix_errors=False, raise_on_error=True)
 
     assert validate(client[uid], fix_errors=False, raise_on_error=False) is False
