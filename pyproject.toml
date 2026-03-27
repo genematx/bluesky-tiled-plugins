@@ -130,6 +130,7 @@ disallow_incomplete_defs = true
 
 
 [tool.ruff]
+line-length = 88
 
 [tool.ruff.lint]
 ignore = [
