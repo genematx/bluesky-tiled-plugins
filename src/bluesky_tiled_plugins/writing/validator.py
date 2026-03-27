@@ -190,111 +190,6 @@ def validate_reading(data_client, ignore_errors=[]):
         )
 
 
-def validate_data_source(
-    data_source, fix_errors=False, metadata=None
-) -> tuple[DataSource, list[str]]:
-    """Validate and optionally fix the structure of a data_source, server-side
-
-    Parameters
-    ----------
-        data_source: tiled.client.data_source.DataSource
-            The data source whose structure is to be validated.
-        fix_errors : bool, optional
-            Whether to attempt to fix structural errors found during validation.
-            Default is False.
-
-    Returns
-    -------
-        list of str
-            A list of human-readable notes describing any fixes applied during validation.
-    """
-
-    data_source = copy.deepcopy(data_source)
-    structure = data_source.structure
-    if isinstance(structure, dict):
-        structure = STRUCTURE_TYPES[data_source.structure_family].from_json(structure)
-        data_source.structure = structure
-    notes = []
-
-    # Initialize adapter from uris and determine the structure as read by the adapter
-    adapter_class = ADAPTERS_BY_MIMETYPE[data_source.mimetype]
-    uris = [asset.data_uri for asset in data_source.assets]
-    true_structure = adapter_class.from_uris(
-        *uris, **data_source.parameters
-    ).structure()
-    true_data_type = true_structure.data_type
-    true_shape = orig_shape = true_structure.shape
-    true_chunks = orig_chunks = true_structure.chunks
-
-    # If this resource has the `frame_per_point`/`multiplier` parameter, the true shape of
-    # the data is expected to be (num_events, multiplier, *rest) and needs to be adjusted,
-    # but only if the original shape in the file is divisible by the multiplier.
-    if multiplier := (metadata or {}).get("frame_per_point"):
-        if not (orig_shape[0] % multiplier):
-            true_shape = (orig_shape[0] // multiplier, multiplier, *orig_shape[1:])
-            true_chunks = (
-                list_summands(true_shape[0], orig_chunks[0][0]),
-                (multiplier,),
-                *orig_chunks[1:],
-            )
-            data_source.properties.update({"chunks": orig_chunks})
-
-    # Validate structure components
-    if structure.shape != true_shape:
-        if not fix_errors:
-            raise StructureValidationException(
-                f"Shape mismatch: {structure.shape} != {true_shape}"
-            )
-        else:
-            msg = f"Fixed shape mismatch: {structure.shape} -> {true_shape}"
-            structure.shape = true_shape
-            notes.append(msg)
-
-    if structure.chunks != true_chunks:
-        if not fix_errors:
-            raise StructureValidationException(
-                f"Chunk shape mismatch: {structure.chunks} != {true_chunks}"
-            )
-        else:
-            _true_chunk_shape = tuple(c[0] for c in true_chunks)
-            _chunk_shape = tuple(c[0] for c in structure.chunks)
-            msg = f"Fixed chunk shape mismatch: {_chunk_shape} -> {_true_chunk_shape}"
-            structure.chunks = true_chunks
-            notes.append(msg)
-
-    if structure.data_type != true_data_type:
-        if not fix_errors:
-            raise StructureValidationException(
-                f"Data type mismatch: {structure.data_type} != {true_data_type}"
-            )
-        else:
-            msg = f"Fixed dtype mismatch: {structure.data_type.to_numpy_dtype()} -> {true_data_type.to_numpy_dtype()}"  # noqa
-            structure.data_type = true_data_type
-            notes.append(msg)
-
-    if structure.dims and (len(structure.dims) != len(true_shape)):
-        if not fix_errors:
-            raise StructureValidationException(
-                f"Number of dimension names mismatch for a {len(true_shape)}-dimensional array: {structure.dims}"
-            )  # noqa
-        else:
-            old_dims = structure.dims
-            if len(old_dims) < len(true_shape):
-                structure.dims = (
-                    ("time",)
-                    + old_dims
-                    + tuple(
-                        f"dim{i}" for i in range(len(old_dims) + 1, len(true_shape))
-                    )
-                )
-            else:
-                structure.dims = old_dims[: len(true_shape)]
-            msg = f"Fixed dimension names: {old_dims} -> {structure.dims}"
-            notes.append(msg)
-
-    return data_source, notes
-
-
 def validate_structure(data_client, fix_errors=False) -> list[str]:
     """Validate and optionally fix the structure of the given (array) dataset, client-side
 
@@ -340,3 +235,120 @@ def validate_structure(data_client, fix_errors=False) -> list[str]:
         data_client.refresh()
 
     return notes
+
+
+def validate_data_source(
+    data_source, fix_errors=False, metadata=None
+) -> tuple[DataSource, list[str]]:
+    """Validate and optionally fix the structure of a data_source
+
+    Parameters
+    ----------
+        data_source: tiled.client.data_source.DataSource
+            The data source whose structure is to be validated.
+        fix_errors : bool, optional
+            Whether to attempt to fix structural errors found during validation.
+            Default is False.
+
+    Returns
+    -------
+        list of str
+            A list of human-readable notes describing any fixes applied during validation.
+    """
+
+    # Ensure the structure is a proper Structure object
+    if isinstance(data_source.structure, dict):
+        data_source.structure = STRUCTURE_TYPES[data_source.structure_family].from_json(
+            data_source.structure
+        )
+
+    # Find an appropriate adapter for this data source and apply custom validation logic
+    adapter_class = ADAPTERS_BY_MIMETYPE[data_source.mimetype]
+    if hasattr(adapter_class, "validate_data_source"):
+        data_source, notes = adapter_class.validate_data_source(
+            data_source, fix_errors=fix_errors
+        )
+    else:
+        data_source, notes = copy.deepcopy(data_source), []
+    structure = data_source.structure
+
+    # Initialize adapter from uris and determine the structure as read by the adapter
+    uris = [asset.data_uri for asset in data_source.assets]
+    true_structure = adapter_class.from_uris(
+        *uris, **data_source.parameters
+    ).structure()
+    true_data_type = true_structure.data_type
+    true_shape = orig_shape = true_structure.shape
+    true_chunks = orig_chunks = true_structure.chunks
+
+    # If this resource has the `frame_per_point`/`multiplier` parameter, the true shape of
+    # the data is expected to be (num_events, multiplier, *rest) and needs to be adjusted,
+    # but only if the original shape in the file is divisible by the multiplier.
+    if multiplier := (metadata or {}).get("frame_per_point"):
+        if not (orig_shape[0] % multiplier):
+            true_shape = (orig_shape[0] // multiplier, multiplier, *orig_shape[1:])
+            true_chunks = (
+                list_summands(true_shape[0], orig_chunks[0][0]),
+                (multiplier,),
+                *orig_chunks[1:],
+            )
+            data_source.properties.update({"chunks": orig_chunks})
+
+    # Update structure components
+    if structure.shape != true_shape:
+        if not fix_errors:
+            raise StructureValidationException(
+                f"Shape mismatch: {structure.shape} != {true_shape}"
+            )
+        else:
+            msg = f"Fixed shape mismatch: {structure.shape} -> {true_shape}"
+            structure.shape = true_shape
+            notes.append(msg)
+
+    if structure.chunks != true_chunks:
+        if not fix_errors:
+            raise StructureValidationException(
+                f"Chunk shape mismatch: {structure.chunks} != {true_chunks}"
+            )
+        else:
+            _true_chunk_shape = tuple(c[0] for c in true_chunks)
+            _chunk_shape = tuple(c[0] for c in structure.chunks)
+            msg = f"Fixed chunk shape mismatch: {_chunk_shape} -> {_true_chunk_shape}"
+            structure.chunks = true_chunks
+            notes.append(msg)
+
+    if structure.data_type != true_data_type:
+        if not fix_errors:
+            raise StructureValidationException(
+                f"Data type mismatch: {structure.data_type} != {true_data_type}"
+            )
+        else:
+            msg = (
+                f"Fixed dtype mismatch: {structure.data_type.to_numpy_dtype()} "
+                f"-> {true_data_type.to_numpy_dtype()}"
+            )
+            structure.data_type = true_data_type
+            notes.append(msg)
+
+    if structure.dims and (len(structure.dims) != len(true_shape)):
+        if not fix_errors:
+            raise StructureValidationException(
+                "Number of dimension names mismatch for a "
+                f"{len(true_shape)}-dimensional array: {structure.dims}"
+            )
+        else:
+            old_dims = structure.dims
+            if len(old_dims) < len(true_shape):
+                structure.dims = (
+                    ("time",)
+                    + old_dims
+                    + tuple(
+                        f"dim{i}" for i in range(len(old_dims) + 1, len(true_shape))
+                    )
+                )
+            else:
+                structure.dims = old_dims[: len(true_shape)]
+            msg = f"Fixed dimension names: {old_dims} -> {structure.dims}"
+            notes.append(msg)
+
+    return data_source, notes
