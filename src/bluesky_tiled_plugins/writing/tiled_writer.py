@@ -938,8 +938,8 @@ class _RunWriter(DocumentRouter):
                         )
 
                 else:
-                    msg = "Remote validation request failed with status code "
-                    f"{response.status_code}: {response.text}"
+                    msg = ("Remote validation request failed with status code "
+                    f"{response.status_code}: {response.text}")
                     raise ValidationError(msg) from e
 
         # Write the stop document to the metadata, include notes from the normalizer, if any
