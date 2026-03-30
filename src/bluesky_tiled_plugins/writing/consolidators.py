@@ -654,7 +654,7 @@ class CSVConsolidator(ConsolidatorBase):
 
 
 class HDF5Consolidator(ConsolidatorBase):
-    supported_mimetypes = {"application/x-hdf5", "application/x-hdf5;type=xia-xmap"}
+    supported_mimetypes = {"application/x-hdf5", "application/x-hdf5;type=xia-xmap", "application/x-hdf5;type=eiger-mx"}
 
     def adapter_parameters(self) -> dict:
         """Parameters to be passed to the HDF5 adapter, a dictionary with the keys:
@@ -733,6 +733,7 @@ class HDF5Consolidator(ConsolidatorBase):
             notes = super().validate(fix_errors=fix_errors)
 
         return notes
+
 
 class MultipartRelatedConsolidator(ConsolidatorBase):
     def __init__(
@@ -947,6 +948,8 @@ CONSOLIDATOR_REGISTRY = collections.defaultdict(
         "multipart/related;type=image/jpeg": JPEGConsolidator,
         "multipart/related;type=application/x-npy": NPYConsolidator,
         "application/x-pizzabox-binary": PizzaBoxConsolidator,
+        "application/x-hdf5;type=xia-xmap": HDF5Consolidator,
+        "application/x-hdf5;type=eiger-mx": HDF5Consolidator,
     },
 )
 
