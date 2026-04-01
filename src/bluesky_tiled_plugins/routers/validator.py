@@ -38,9 +38,7 @@ class ValidationResponse(pydantic.BaseModel):
 async def validate_structure_operation(
     path: str,
     request: Request,
-    fix_errors: bool = Query(
-        False, description="Attempt to correct structure to match data."
-    ),
+    fix: bool = Query(False, description="Attempt to correct structure to match data."),
     settings: Settings = Depends(get_settings),
     principal: Optional[Principal] = Depends(get_current_principal),
     root_tree=Depends(get_root_tree),
@@ -53,7 +51,7 @@ async def validate_structure_operation(
 
     Parameters:
     ----------
-    fix_errors: bool
+    fix: bool
         If True, attempt to correct any structural issues in the data sources.
 
     Returns:
@@ -93,7 +91,7 @@ async def validate_structure_operation(
                     try:
                         valid_data_source, _notes = validate_data_source(
                             data_source,
-                            fix_errors=fix_errors,
+                            fix_errors=fix,
                             metadata=dkey_node.metadata(),
                             adapters_by_mimetype=entry.context.adapters_by_mimetype,
                         )

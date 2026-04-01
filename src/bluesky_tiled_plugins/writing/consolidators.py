@@ -509,6 +509,7 @@ class CSVConsolidator(ConsolidatorBase):
 
     def adapter_parameters(self) -> dict:
         allowed_keys = {
+            "assume_missing",
             "comment",
             "delimiter",
             "dtype",
