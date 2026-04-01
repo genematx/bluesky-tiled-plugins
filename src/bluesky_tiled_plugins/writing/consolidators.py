@@ -649,7 +649,7 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         files_per_datum = (
             self.datum_shape[0] // self.chunk_shape[0]
             if self.join_method == "concat"
-            else 1
+            else self.metadata.get("frame_per_point", 1)
         )
         first_file_indx = doc["indices"]["start"] * files_per_datum
         last_file_indx = doc["indices"]["stop"] * files_per_datum
