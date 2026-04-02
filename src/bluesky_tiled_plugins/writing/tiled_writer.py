@@ -721,7 +721,9 @@ class _RunWriter(DocumentRouter):
                 )
             else:
                 arr_client.patch(
-                    numpy.array(arr_lst), offset=arr_client.shape[:1], extend=True
+                    numpy.array(arr_lst, dtype=arr_client.dtype),
+                    offset=arr_client.shape[:1],
+                    extend=True,
                 )
 
         # 2. Write internal tabular data; all data_keys for arrays have been removed from data_cache on step 1
