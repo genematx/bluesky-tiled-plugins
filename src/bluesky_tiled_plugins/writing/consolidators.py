@@ -127,12 +127,7 @@ class ConsolidatorBase:
 
         self.data_key = stream_resource["data_key"]
         self.uri = stream_resource["uri"]
-        if (stream_resource["parameters"].get("_resource_spec") == 'AD_EIGER_MX') \
-            and (stream_resource["parameters"].get("data_key") == "data"):
-            self.assets: list[Asset] = [
-            Asset(data_uri=self.uri, is_directory=False, parameter="master")
-            ]
-        elif self.mimetype in {"image/jpeg", "image/tiff"}:
+        if self.mimetype in {"image/jpeg", "image/tiff"}:
             self.assets: list[Asset] = [Asset(data_uri=self.uri, is_directory=False, parameter="data_uri")]
         else:
             self.assets: list[Asset] = [
@@ -950,7 +945,6 @@ CONSOLIDATOR_REGISTRY = collections.defaultdict(
         "multipart/related;type=application/x-npy": NPYConsolidator,
         "application/x-pizzabox-binary": PizzaBoxConsolidator,
         "application/x-hdf5;type=xia-xmap": HDF5Consolidator,
-        "application/x-hdf5;type=eiger-mx": HDF5Consolidator,
     },
 )
 
