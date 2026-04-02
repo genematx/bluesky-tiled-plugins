@@ -703,7 +703,7 @@ class _RunWriter(DocumentRouter):
             if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):
                 metadata = truncate_json_overflow(self.data_keys.get(key, {}))
                 arr_client = desc_node.write_array(
-                    numpy.array(arr_lst),
+                    numpy.array(arr_lst, dtype=metadata.get("dtype_numpy", None)),
                     key=key,
                     metadata=metadata,
                     dims=("time", "dim_1"),  # Always 2D
@@ -715,7 +715,9 @@ class _RunWriter(DocumentRouter):
                 )
             else:
                 arr_client.patch(
-                    numpy.array(arr_lst), offset=arr_client.shape[:1], extend=True
+                    numpy.array(arr_lst, dtype=arr_client.dtype),
+                    offset=arr_client.shape[:1],
+                    extend=True,
                 )
 
         # 2. Write internal tabular data; all data_keys for arrays have been removed from data_cache on step 1
