@@ -709,7 +709,7 @@ class _RunWriter(DocumentRouter):
             if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):
                 metadata = truncate_json_overflow(self.data_keys.get(key, {}))
                 arr_client = desc_node.write_array(
-                    numpy.array(arr_lst),
+                    numpy.array(arr_lst, dtype=metadata.get("dtype_numpy", None)),
                     key=key,
                     metadata=metadata,
                     dims=("time", "dim_1"),  # Always 2D
