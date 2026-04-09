@@ -5,7 +5,8 @@ from collections import defaultdict, deque, namedtuple
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+import re
+from typing import Any, Optional, cast
 import warnings
 
 import httpx
@@ -47,6 +48,7 @@ from packaging.version import Version
 from ..utils import truncate_json_overflow
 from ._dispatcher import Dispatcher
 from ._json_writer import JSONLinesWriter
+from .validator import ValidationException
 from .consolidators import (
     ConsolidatorBase,
     DataSource,
@@ -108,12 +110,6 @@ MIMETYPE_LOOKUP = defaultdict(
 )
 
 logger = logging.getLogger(__name__)
-
-
-class ValidationError(Exception):
-    """Custom exception for validation errors in Tiled RunWriter."""
-
-    pass
 
 
 def concatenate_stream_datums(*docs: StreamDatum):
@@ -634,6 +630,7 @@ class _RunWriter(DocumentRouter):
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
         validate: bool = False,
+        ignore_errors: Optional[list[str]] = None,
     ):
         """Write documents from a single Bluesky Run into Tiled.
 
@@ -677,6 +674,7 @@ class _RunWriter(DocumentRouter):
             max_array_size  # Max size of arrays to write to tabular storage
         )
         self._validate: bool = validate
+        self.ignore_errors = ignore_errors or []
         self.data_keys: dict[str, DataKey] = {}
         self.access_tags: list[str] | None = None
         self.notes: list[str] = []
@@ -856,9 +854,10 @@ class _RunWriter(DocumentRouter):
         if self._validate:
             for attempt in retry_context():
                 with attempt:
-                    response = self.root_node.context.http_client.get(
+                    response = self.root_node.context.http_client.post(
                         self.root_node.uri.replace("/metadata/", "/validate/", 1),
                         params={"fix": True},
+                        content=safe_json_dump({"ignore_errors": self.ignore_errors}),
                     )
 
             try:
@@ -871,7 +870,7 @@ class _RunWriter(DocumentRouter):
                         warnings.warn(note, stacklevel=2)
                 else:
                     msg = "Remote validation failed: " + "; ".join(_notes)
-                    raise ValidationError(msg)
+                    raise ValidationException(msg, self.root_node.item["id"])
 
             except httpx.HTTPStatusError as e:
                 # Backcompatibility: if the server does not support validation endpoint,
@@ -885,17 +884,6 @@ class _RunWriter(DocumentRouter):
                     )
                     for sres_node, consolidator in node_and_cons:
                         title = f"Validation of '{sres_node.item['id']}'"
-                        try:
-                            _notes = consolidator.validate(fix_errors=True)
-                            self.notes.extend([title + ": " + note for note in _notes])
-                        except Exception as e:
-                            msg = (
-                                f"{type(e).__name__}: "
-                                + str(e).replace("\n", " ").replace("\r", "").strip()
-                            )
-                            msg = title + f" failed with error: {msg}"
-                            raise ValidationError(msg) from e
-
                         try:
                             _notes = consolidator.validate(fix_errors=True)
                             self.notes.extend([title + ": " + note for note in _notes])
@@ -917,11 +905,11 @@ class _RunWriter(DocumentRouter):
                                             logger.error(msg + " Continuing validation.")
                                 else:
                                     msg = title + f" failed with error: {e}"
-                                    raise ValidationError(msg) from e
+                                    raise ValidationException(msg, sres_node.item["id"]) from e
                             else:
                                 msg = title + f" failed with error: neither {e.filename}, " \
                                     + "nor its parent directory exist. Cannot continue validation."
-                                raise ValidationError(msg) from e
+                                raise ValidationException(msg, sres_node.item["id"]) from e
                         except Exception as e:
                             msg = (
                                 f"{type(e).__name__}: "
@@ -933,8 +921,11 @@ class _RunWriter(DocumentRouter):
                             elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
                                 ("out of bounds for axis 1 with size " in msg and "xs_settings_" in msg):
                                 logger.warning(msg + " Continuing validation.")
+                            elif any(re.search(ptrn, msg) for ptrn in self.ignore_errors):
+                                warnings.warn(msg)
                             else:
-                                raise ValidationError(msg) from e
+                                raise ValidationException(msg, sres_node.item["id"]) from e
+
                         self._update_data_source_for_node(
                             sres_node, consolidator.get_data_source()
                         )
@@ -944,7 +935,7 @@ class _RunWriter(DocumentRouter):
                         "Remote validation request failed with status code "
                         f"{response.status_code}: {response.text}"
                     )
-                    raise ValidationError(msg) from e
+                    raise ValidationException(msg, self.root_node.item["id"]) from e
 
         # Write the stop document to the metadata, include notes from the normalizer, if any
         notes = doc.pop("_run_normalizer_notes", []) + self.notes
@@ -1116,6 +1107,7 @@ class TiledWriter:
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
         validate: bool = False,
+        ignore_errors: Optional[list[str]] = None,
     ):
         """Callback for write metadata and data from Bluesky documents into Tiled.
 
@@ -1169,6 +1161,7 @@ class TiledWriter:
         self._batch_size = batch_size
         self._max_array_size = max_array_size
         self._validate = validate
+        self.ignore_errors = ignore_errors or []
 
     def _factory(self, name, doc):
         """Factory method to create a callback for writing a single run into Tiled."""
@@ -1177,6 +1170,7 @@ class TiledWriter:
             batch_size=self._batch_size,
             max_array_size=self._max_array_size,
             validate=self._validate,
+            ignore_errors=self.ignore_errors,
         )
 
         if self._normalizer:
