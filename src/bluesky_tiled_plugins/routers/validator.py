@@ -53,8 +53,8 @@ async def validate_entry_structure(
         If True, attempt to correct any structural issues in the data sources.
     ignore_errors: list[str], optional
         A list of (parts of) error messages to ignore during validation. If an error message
-        matches any in this list, it will not cause the validation to fail, and its details
-        will not be included in the returned notes.
+        matches any in this list, it will be included in the notes, but the validation for
+        the remaining data sources will continue.
 
     Returns:
     -------

@@ -67,7 +67,9 @@ def validate(
         Whether to raise an exception on the first validation error encountered.
         Default is False.
     ignore_errors : list of str, optional
-        List of error messages to ignore during validation. Default is an empty list.
+        List of error messages to ignore during validation. If any errors whose
+        message matches one of the patterns in this list are encountered, they will
+        be logged, but the validation of the remaining data keys will continue.
 
     Returns
     -------
