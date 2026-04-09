@@ -505,6 +505,9 @@ def test_ignore_validation_errors(client, external_assets_folder, ignore_errors)
     else:
         assert "stop" not in run.metadata
 
+    with pytest.raises(Exception):
+        run["primary"].read()
+
 
 @pytest.mark.parametrize("squeeze", [True, False])
 def test_slice_and_squeeze(client, external_assets_folder, squeeze):
