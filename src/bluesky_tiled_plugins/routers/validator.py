@@ -199,7 +199,7 @@ async def get_validate_operation(
         )
 
     # First validate the structure of the data sources
-    valid, notes = await validate_entry_structure(entry, fix=fix, read=read)
+    valid, notes = await validate_entry_structure(entry, fix=fix)
 
     # If structure is valid and reading validation is requested, validate reading
     if valid and read:
