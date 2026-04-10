@@ -53,6 +53,7 @@ Changelog = "https://github.com/bluesky/bluesky-tiled-plugins/releases"
 CatalogOfBlueskyRuns = "bluesky_tiled_plugins.clients.catalog_of_bluesky_runs:CatalogOfBlueskyRuns"
 BlueskyRun = "bluesky_tiled_plugins.clients.bluesky_run:BlueskyRun"
 BlueskyEventStream = "bluesky_tiled_plugins.clients.bluesky_event_stream:BlueskyEventStream"
+LatentSpaceEmbedding = "bluesky_tiled_plugins.clients.embedding:LatentSpaceEmbedding"
 
 [dependency-groups]
 test = [
