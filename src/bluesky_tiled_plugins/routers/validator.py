@@ -161,7 +161,7 @@ async def validate_entry_reading(entry, ignore_errors=None):
 
 
 @router.get("/validate/{path:path}")
-async def validate_operation(
+async def get_validate_operation(
     path: str,
     request: Request,
     fix: Optional[bool] = Query(
@@ -203,14 +203,14 @@ async def validate_operation(
 
     # If structure is valid and reading validation is requested, validate reading
     if valid and read:
-        valid, _notes = await validate_entry_reading(entry, ignore_errors=None)
+        valid, _notes = await validate_entry_reading(entry)
         notes.extend(_notes)
 
     return ValidationResponse(valid=valid, notes=notes)
 
 
 @router.post("/validate/{path:path}")
-async def validate_operation_post(
+async def post_validate_operation(
     path: str,
     body: PostValidationRequest,
     request: Request,
@@ -229,7 +229,7 @@ async def validate_operation_post(
     authn_scopes: Scopes = Depends(get_current_scopes),
     _=Security(check_scopes, scopes=["read:data", "read:metadata", "write:metadata"]),
 ):
-    # POST version of the same endpoint, to allow for longer query parameters (e.g. ignore_errors)
+    # POST version of the same endpoint, to allow for longer parameters (e.g. ignore_errors)
     entry = await get_entry(
         path,
         ["read:data", "read:metadata", "write:metadata"],
