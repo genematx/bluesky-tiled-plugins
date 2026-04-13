@@ -156,7 +156,7 @@ class LatentSpaceEmbedding(CompositeClient):
         empty_notes = _make_string_array([""] * batch_size, NOTES_MAX_LEN)
         empty_user_labels = _make_string_array([""] * batch_size, USER_LABEL_MAX_LEN)
 
-        # Arrays: create on first insert, extend on subsequent
+        # Arrays: create on first insert, extend on subsequent.
         if "embeddings" not in self:
             self.write_array(
                 embeddings.astype(np.float32),
@@ -284,18 +284,25 @@ class LatentSpaceEmbedding(CompositeClient):
             raise ValueError(msg)
 
         current_n = self.num_embeddings
+
+        # Write arrays first, then _index table last.
+        # The UI subscribes to both streams; writing the table last ensures
+        # projections are committed before the table WS event arrives.
         self._write_arrays(embeddings, thumbnails, projections, offset=current_n)
 
-        # Append rows to the _index table with metadata for each embedding.
-        # Ensure unique and strictly increasing timestamps by adding a small offset.
         table = pa.table(
             {
                 "path": paths,
                 "slice": [None] * batch_size if slices is None else slices,
                 "label": [None] * batch_size if labels is None else labels,
-                "model_version": [model_version or self.metadata.get("model_version")] * batch_size,
-                "mlflow_run_id": [mlflow_run_id or self.metadata.get("mlflow_run_id", "")] * batch_size,
-                "timestamp": timestamps or np.array([time.time()] * batch_size) + np.arange(batch_size) * 1e-6,
+                "model_version": [model_version or self.metadata.get("model_version")]
+                * batch_size,
+                "mlflow_run_id": [
+                    mlflow_run_id or self.metadata.get("mlflow_run_id", "")
+                ]
+                * batch_size,
+                "timestamp": timestamps
+                or np.array([time.time()] * batch_size) + np.arange(batch_size) * 1e-6,
             },
             schema=INDEX_SCHEMA,
         )
