@@ -37,6 +37,9 @@ const POINT_RADIUS = 4;
 const HOVER_RADIUS = 8;
 const NOTES_MAX_LEN = 1024;
 const USER_LABEL_MAX_LEN = 64;
+const CANVAS_HEIGHT = 500;
+const PANEL_WIDTH = 280;
+const PANEL_INSET = 70;
 const LABEL_COLORS: Record<string, string> = {};
 const COLOR_PALETTE = [
   "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -46,7 +49,7 @@ const COLOR_PALETTE = [
 let colorIdx = 0;
 
 function getLabelColor(label: string): string {
-  if (!label || label === "") return "#888888";
+  if (!label) return "#888888";
   if (!LABEL_COLORS[label]) {
     LABEL_COLORS[label] = COLOR_PALETTE[colorIdx % COLOR_PALETTE.length];
     colorIdx++;
@@ -164,24 +167,17 @@ function EmbeddingScatter({
     startOffsetY: number;
   } | null>(null);
   const [containerWidth, setContainerWidth] = React.useState(800);
-  const CANVAS_HEIGHT = 500;
-  const PANEL_WIDTH = 280;
-  const PANEL_GAP = 8;
   // Track how many points we've loaded so far for incremental fetching
   const pointCountRef = React.useRef(0);
-  // Track whether initial view fit has been applied
-  const initialFitDone = React.useRef(false);
   // Skip the catch-up refreshAll on the first live-effect run after initial load
   const skipCatchupRef = React.useRef(false);
 
-  const apiUrl = React.useMemo(() => {
-    return `${window.location.origin}/api/v1`;
-  }, []);
+  const apiUrl = `${window.location.origin}/api/v1`;
 
   const nodePath = segments.join("/");
 
   const canvasWidth = selected
-    ? containerWidth - Math.round(PANEL_WIDTH / 4)
+    ? containerWidth - PANEL_INSET
     : containerWidth;
 
   // Fetch all current data (projections + index) and merge into state
@@ -236,7 +232,6 @@ function EmbeddingScatter({
         if (pts && pts.length > 0) {
           const fitted = fitViewToPoints(pts, canvasWidthRef.current, CANVAS_HEIGHT);
           setView(fitted);
-          initialFitDone.current = true;
         }
       } catch (err: any) {
         if (!cancelled) setError(err.message);
@@ -271,27 +266,58 @@ function EmbeddingScatter({
   React.useEffect(() => {
     if (loading || !liveEnabled) return;
 
-    let projWs: WebSocket | null = null;
-    let indexWs: WebSocket | null = null;
-    let projReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let indexReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let disposed = false;
-    let projSchemaReceived = false;
-    let indexSchemaReceived = false;
-    let projConnected = false;
-    let indexConnected = false;
+    const wsScheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsBase = `${wsScheme}//${window.location.host}/api/v1/stream/single/${nodePath}`;
 
-    // Buffer for table metadata that arrived before projections.
-    // Keyed by startIndex → {labels, paths}.
-    const pendingMeta: Map<
-      number,
-      { labels: string[]; paths: string[] }
-    > = new Map();
+    interface WsConn {
+      ws: WebSocket | null;
+      timer: ReturnType<typeof setTimeout> | null;
+      connected: boolean;
+      schemaReceived: boolean;
+    }
+
+    const proj: WsConn = { ws: null, timer: null, connected: false, schemaReceived: false };
+    const idx: WsConn = { ws: null, timer: null, connected: false, schemaReceived: false };
+    let disposed = false;
+
+    // Buffer for table metadata that arrived before projections
+    const pendingMeta = new Map<number, { labels: string[]; paths: string[] }>();
 
     function updateStatus() {
-      if (projConnected && indexConnected) setWsStatus("connected");
-      else if (projConnected || indexConnected) setWsStatus("connecting");
+      if (proj.connected && idx.connected) setWsStatus("connected");
+      else if (proj.connected || idx.connected) setWsStatus("connecting");
       else setWsStatus("disconnected");
+    }
+
+    function connect(conn: WsConn, subpath: string, handler: (msg: any) => void) {
+      function doConnect() {
+        if (disposed) return;
+        conn.schemaReceived = false;
+        conn.ws = new WebSocket(`${wsBase}/${subpath}?envelope_format=json`);
+        conn.ws.onopen = () => {
+          if (disposed) { conn.ws?.close(); return; }
+          conn.connected = true;
+          updateStatus();
+        };
+        conn.ws.onmessage = (event) => {
+          if (disposed) return;
+          try {
+            const msg = JSON.parse(event.data);
+            if (!conn.schemaReceived && msg.type?.endsWith("-schema")) {
+              conn.schemaReceived = true;
+              return;
+            }
+            handler(msg);
+          } catch { /* ignore parse errors */ }
+        };
+        conn.ws.onclose = () => {
+          conn.connected = false;
+          updateStatus();
+          if (!disposed) conn.timer = setTimeout(doConnect, 3000);
+        };
+        conn.ws.onerror = () => {};
+      }
+      doConnect();
     }
 
     // Catch up on anything missed while live was off or WS was disconnected.
@@ -394,94 +420,20 @@ function EmbeddingScatter({
       }
     }
 
-    function connectProjections() {
-      if (disposed) return;
-      projSchemaReceived = false;
-      const wsScheme =
-        window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl =
-        `${wsScheme}//${window.location.host}/api/v1/stream/single/${nodePath}/projections` +
-        `?envelope_format=json`;
-      projWs = new WebSocket(wsUrl);
-
-      projWs.onopen = () => {
-        if (disposed) { projWs?.close(); return; }
-        projConnected = true;
-        updateStatus();
-      };
-      projWs.onmessage = (event) => {
-        if (disposed) return;
-        try {
-          const msg = JSON.parse(event.data);
-          if (!projSchemaReceived) {
-            if (msg.type && msg.type.endsWith("-schema")) {
-              projSchemaReceived = true;
-              return;
-            }
-          }
-          handleProjectionEvent(msg);
-        } catch { /* ignore parse errors */ }
-      };
-      projWs.onclose = () => {
-        projConnected = false;
-        updateStatus();
-        if (!disposed) projReconnectTimer = setTimeout(connectProjections, 3000);
-      };
-      projWs.onerror = () => {};
-    }
-
-    function connectIndex() {
-      if (disposed) return;
-      indexSchemaReceived = false;
-      const wsScheme =
-        window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl =
-        `${wsScheme}//${window.location.host}/api/v1/stream/single/${nodePath}/_index` +
-        `?envelope_format=json`;
-      indexWs = new WebSocket(wsUrl);
-
-      indexWs.onopen = () => {
-        if (disposed) { indexWs?.close(); return; }
-        indexConnected = true;
-        updateStatus();
-      };
-      indexWs.onmessage = (event) => {
-        if (disposed) return;
-        try {
-          const msg = JSON.parse(event.data);
-          if (!indexSchemaReceived) {
-            if (msg.type && msg.type.endsWith("-schema")) {
-              indexSchemaReceived = true;
-              return;
-            }
-          }
-          handleTableEvent(msg);
-        } catch { /* ignore parse errors */ }
-      };
-      indexWs.onclose = () => {
-        indexConnected = false;
-        updateStatus();
-        if (!disposed) indexReconnectTimer = setTimeout(connectIndex, 3000);
-      };
-      indexWs.onerror = () => {};
-    }
-
-    connectProjections();
-    connectIndex();
+    connect(proj, "projections", handleProjectionEvent);
+    connect(idx, "_index", handleTableEvent);
 
     return () => {
       disposed = true;
-      if (projReconnectTimer) clearTimeout(projReconnectTimer);
-      if (indexReconnectTimer) clearTimeout(indexReconnectTimer);
-      if (projWs) { projWs.onclose = null; projWs.close(); }
-      if (indexWs) { indexWs.onclose = null; indexWs.close(); }
+      for (const c of [proj, idx]) {
+        if (c.timer) clearTimeout(c.timer);
+        if (c.ws) { c.ws.onclose = null; c.ws.close(); }
+      }
       setWsStatus("disconnected");
     };
   }, [loading, liveEnabled, nodePath, apiUrl, refreshAll]);
 
   // Resize observer — tracks container width
-  const selectedRef = React.useRef(selected);
-  selectedRef.current = selected;
   React.useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -506,8 +458,6 @@ function EmbeddingScatter({
     canvas.width = canvasWidth * dpr;
     canvas.height = CANVAS_HEIGHT * dpr;
     ctx.scale(dpr, dpr);
-
-    ctx.clearRect(0, 0, canvasWidth, CANVAS_HEIGHT);
 
     ctx.fillStyle = "#fafafa";
     ctx.fillRect(0, 0, canvasWidth, CANVAS_HEIGHT);
@@ -625,16 +575,19 @@ function EmbeddingScatter({
     [toDataCoords, findPoint, apiUrl, nodePath],
   );
 
+  const viewRef = React.useRef(view);
+  viewRef.current = view;
+
   const handleMouseDown = React.useCallback(
     (e: React.MouseEvent) => {
       dragRef.current = {
         startX: e.clientX,
         startY: e.clientY,
-        startOffsetX: view.offsetX,
-        startOffsetY: view.offsetY,
+        startOffsetX: viewRef.current.offsetX,
+        startOffsetY: viewRef.current.offsetY,
       };
     },
-    [view],
+    [],
   );
 
   const handleMouseUp = React.useCallback(() => {
@@ -917,15 +870,15 @@ function EmbeddingScatter({
                 width: PANEL_WIDTH,
                 height: CANVAS_HEIGHT,
                 background: "white",
-              border: "1px solid #ccc",
-              borderRadius: 4,
-              padding: "12px 16px",
-              boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
-              overflowY: "auto" as const,
-              fontSize: 13,
-              boxSizing: "border-box" as const,
+                border: "1px solid #ccc",
+                borderRadius: 4,
+                padding: "12px 16px",
+                boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                overflowY: "auto" as const,
+                fontSize: 13,
+                boxSizing: "border-box" as const,
+              },
             },
-          },
             // Close button
             React.createElement(
               "button",
