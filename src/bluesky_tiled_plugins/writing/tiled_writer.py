@@ -902,9 +902,13 @@ class _RunWriter(DocumentRouter):
                                                 + "but its parent directory exists and is readable."
                                             self.notes.append(msg)
                                             logger.error(msg + " Continuing validation.")
+                                elif any(re.search(ptrn, str(e)) for ptrn in self.ignore_errors):
+                                    warnings.warn("Ignored validation error: " + str(e) + " Continuing validation.")
                                 else:
                                     msg = title + f" failed with error: {e}"
                                     raise ValidationException(msg, sres_node.item["id"]) from e
+                            elif any(re.search(ptrn, str(e)) for ptrn in self.ignore_errors):
+                                warnings.warn("Ignored validation error: " + str(e) + " Continuing validation.")
                             else:
                                 msg = title + f" failed with error: neither {e.filename}, " \
                                     + "nor its parent directory exist. Cannot continue validation."
@@ -915,6 +919,7 @@ class _RunWriter(DocumentRouter):
                                 + str(e).replace("\n", " ").replace("\r", "").strip()
                             )
                             msg = title + f" failed with error: {msg}"
+                            breakpoint()
                             if "PCAP.TS_TRIG.Value" in str(e):
                                 logger.warning(msg + " Continuing validation.")
                             elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
