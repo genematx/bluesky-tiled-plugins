@@ -25,6 +25,13 @@ interface SelectedPointInfo {
   saving: boolean;
 }
 
+interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  timestamp: number;
+}
+
 interface ViewState {
   offsetX: number;
   offsetY: number;
@@ -160,6 +167,11 @@ function EmbeddingScatter({
   );
   const [apiKey, setApiKey] = React.useState("");
   const [saveError, setSaveError] = React.useState<string | null>(null);
+  const [chatOpen, setChatOpen] = React.useState(false);
+  const [chatMessages, setChatMessages] = React.useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = React.useState("");
+  const [chatSending, setChatSending] = React.useState(false);
+  const chatListRef = React.useRef<HTMLDivElement>(null);
   const dragRef = React.useRef<{
     startX: number;
     startY: number;
@@ -175,8 +187,9 @@ function EmbeddingScatter({
   const apiUrl = `${window.location.origin}/api/v1`;
 
   const nodePath = segments.join("/");
+  const customUrl = `${window.location.origin}/custom/embedding-ui`;
 
-  const canvasWidth = selected
+  const canvasWidth = selected || chatOpen
     ? containerWidth - PANEL_INSET
     : containerWidth;
 
@@ -618,6 +631,8 @@ function EmbeddingScatter({
         setSelected(null);
         return;
       }
+      // Close chat when selecting a point (mutual exclusion)
+      setChatOpen(false);
       const thumbUrl = `${apiUrl}/array/full/${nodePath}/thumbnails?format=image/png&slice=${p.index}`;
       setSelected({
         point: p,
@@ -673,6 +688,64 @@ function EmbeddingScatter({
       );
     }
   }, [selected, apiKey, apiUrl, nodePath]);
+
+  const loadChatHistory = React.useCallback(async () => {
+    try {
+      const res = await fetch(`${customUrl}/chat/history/${nodePath}`);
+      if (res.ok) {
+        const history: ChatMessage[] = await res.json();
+        setChatMessages(history);
+      }
+    } catch { /* ignore */ }
+  }, [customUrl, nodePath]);
+
+  const sendChatMessage = React.useCallback(async () => {
+    const text = chatInput.trim();
+    if (!text || chatSending) return;
+    setChatInput("");
+    setChatSending(true);
+
+    // Optimistically add user message
+    const userMsg: ChatMessage = {
+      id: Date.now().toString(36),
+      role: "user",
+      content: text,
+      timestamp: Date.now() / 1000,
+    };
+    setChatMessages((prev) => [...prev, userMsg]);
+
+    try {
+      const res = await fetch(`${customUrl}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, node_path: nodePath }),
+      });
+      if (res.ok) {
+        const assistantMsg: ChatMessage = await res.json();
+        setChatMessages((prev) => [...prev, assistantMsg]);
+      }
+    } catch { /* ignore */ }
+    setChatSending(false);
+  }, [chatInput, chatSending, customUrl, nodePath]);
+
+  const clearChatHistory = React.useCallback(async () => {
+    try {
+      await fetch(`${customUrl}/chat/history/${nodePath}`, { method: "DELETE" });
+      setChatMessages([]);
+    } catch { /* ignore */ }
+  }, [customUrl, nodePath]);
+
+  // Load chat history when chat panel opens
+  React.useEffect(() => {
+    if (chatOpen) loadChatHistory();
+  }, [chatOpen, loadChatHistory]);
+
+  // Auto-scroll chat to bottom when new messages arrive
+  React.useEffect(() => {
+    if (chatListRef.current) {
+      chatListRef.current.scrollTop = chatListRef.current.scrollHeight;
+    }
+  }, [chatMessages]);
 
   const uniqueLabels = React.useMemo(() => {
     const labels = new Set<string>();
@@ -770,8 +843,52 @@ function EmbeddingScatter({
                 : "Reconnecting...",
         ),
       ),
+      // Chat toggle button
+      React.createElement(
+        "button",
+        {
+          onClick: () => {
+            setChatOpen((v) => {
+              if (!v) setSelected(null); // close detail panel when opening chat
+              return !v;
+            });
+            setSaveError(null);
+          },
+          title: chatOpen ? "Close chat" : "Chat with data",
+          style: {
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+            fontSize: 12,
+            background: chatOpen ? "#1976d2" : "none",
+            border: chatOpen ? "1px solid #1976d2" : "1px solid #ccc",
+            borderRadius: 12,
+            padding: "2px 10px",
+            cursor: "pointer",
+            color: chatOpen ? "#fff" : "#555",
+            transition: "background 0.2s, color 0.2s, border-color 0.2s",
+          },
+        },
+        // Chat bubble icon (SVG)
+        React.createElement(
+          "svg",
+          {
+            width: 14,
+            height: 14,
+            viewBox: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            strokeWidth: 2,
+            strokeLinecap: "round",
+            strokeLinejoin: "round",
+          },
+          React.createElement("path", {
+            d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
+          }),
+        ),
+        React.createElement("span", null, "Chat"),
+      ),
     ),
-    // Content area: canvas + panel side by side
     React.createElement(
       "div",
       { style: { position: "relative" } },
@@ -842,19 +959,7 @@ function EmbeddingScatter({
                   `Label: ${tooltip.point.label}`,
                 )
               : null,
-            tooltip.point.path
-              ? React.createElement(
-                  "div",
-                  {
-                    style: {
-                      color: "#1976d2",
-                      fontSize: 11,
-                      wordBreak: "break-all",
-                    },
-                  },
-                  tooltip.point.path,
-                )
-              : null,
+
           )
         : null,
       ),
@@ -1075,6 +1180,243 @@ function EmbeddingScatter({
                     saveError,
                   )
                 : null,
+          )
+        : null,
+      // Chat panel — same position as detail panel (mutual exclusion)
+      chatOpen && !selected
+        ? React.createElement(
+            "div",
+            {
+              style: {
+                position: "absolute" as const,
+                right: 0,
+                top: 0,
+                width: PANEL_WIDTH,
+                height: CANVAS_HEIGHT,
+                background: "white",
+                border: "1px solid #ccc",
+                borderRadius: 4,
+                boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                fontSize: 13,
+                boxSizing: "border-box" as const,
+                display: "flex",
+                flexDirection: "column" as const,
+              },
+            },
+            // Chat header
+            React.createElement(
+              "div",
+              {
+                style: {
+                  padding: "10px 16px",
+                  borderBottom: "1px solid #eee",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  flexShrink: 0,
+                },
+              },
+              React.createElement(
+                "span",
+                { style: { fontWeight: 500, color: "#333" } },
+                "Chat with data",
+              ),
+              React.createElement(
+                "div",
+                { style: { display: "flex", gap: 8, alignItems: "center" } },
+                // Clear history button
+                chatMessages.length > 0
+                  ? React.createElement(
+                      "button",
+                      {
+                        onClick: clearChatHistory,
+                        title: "Clear conversation",
+                        style: {
+                          background: "none",
+                          border: "none",
+                          fontSize: 12,
+                          color: "#999",
+                          cursor: "pointer",
+                          padding: 0,
+                        },
+                      },
+                      "Clear",
+                    )
+                  : null,
+                // Close button
+                React.createElement(
+                  "button",
+                  {
+                    onClick: () => setChatOpen(false),
+                    style: {
+                      background: "none",
+                      border: "none",
+                      fontSize: 18,
+                      cursor: "pointer",
+                      color: "#999",
+                      lineHeight: 1,
+                      padding: 0,
+                    },
+                  },
+                  "\u00D7",
+                ),
+              ),
+            ),
+            // Message list
+            React.createElement(
+              "div",
+              {
+                ref: chatListRef,
+                style: {
+                  flex: 1,
+                  overflowY: "auto" as const,
+                  padding: "8px 16px",
+                },
+              },
+              chatMessages.length === 0
+                ? React.createElement(
+                    "div",
+                    {
+                      style: {
+                        color: "#aaa",
+                        fontSize: 12,
+                        textAlign: "center" as const,
+                        marginTop: 40,
+                      },
+                    },
+                    "Ask a question about your dataset",
+                  )
+                : null,
+              ...chatMessages.map((msg) =>
+                React.createElement(
+                  "div",
+                  {
+                    key: msg.id,
+                    style: {
+                      marginBottom: 10,
+                      display: "flex",
+                      flexDirection: "column" as const,
+                      alignItems: msg.role === "user" ? "flex-end" : "flex-start",
+                    },
+                  },
+                  React.createElement(
+                    "div",
+                    {
+                      style: {
+                        background: msg.role === "user" ? "#1976d2" : "#f0f0f0",
+                        color: msg.role === "user" ? "#fff" : "#333",
+                        padding: "6px 10px",
+                        borderRadius: msg.role === "user" ? "12px 12px 2px 12px" : "12px 12px 12px 2px",
+                        maxWidth: "85%",
+                        fontSize: 12,
+                        lineHeight: "1.4",
+                        wordBreak: "break-word" as const,
+                      },
+                    },
+                    msg.content,
+                  ),
+                ),
+              ),
+              // Typing indicator while sending
+              chatSending
+                ? React.createElement(
+                    "div",
+                    {
+                      style: {
+                        display: "flex",
+                        alignItems: "flex-start",
+                        marginBottom: 10,
+                      },
+                    },
+                    React.createElement(
+                      "div",
+                      {
+                        style: {
+                          background: "#f0f0f0",
+                          padding: "6px 10px",
+                          borderRadius: "12px 12px 12px 2px",
+                          fontSize: 12,
+                          color: "#999",
+                        },
+                      },
+                      "Thinking...",
+                    ),
+                  )
+                : null,
+            ),
+            // Input area
+            React.createElement(
+              "div",
+              {
+                style: {
+                  padding: "8px 12px",
+                  borderTop: "1px solid #eee",
+                  display: "flex",
+                  gap: 6,
+                  flexShrink: 0,
+                },
+              },
+              React.createElement("input", {
+                type: "text",
+                value: chatInput,
+                placeholder: "Ask about the data...",
+                onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
+                  setChatInput(e.target.value),
+                onKeyDown: (e: React.KeyboardEvent) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    sendChatMessage();
+                  }
+                },
+                disabled: chatSending,
+                style: {
+                  flex: 1,
+                  padding: "6px 10px",
+                  border: "1px solid #ccc",
+                  borderRadius: 16,
+                  fontSize: 12,
+                  outline: "none",
+                  boxSizing: "border-box" as const,
+                },
+              }),
+              React.createElement(
+                "button",
+                {
+                  onClick: sendChatMessage,
+                  disabled: chatSending || !chatInput.trim(),
+                  style: {
+                    background: chatInput.trim() && !chatSending ? "#1976d2" : "#e0e0e0",
+                    color: chatInput.trim() && !chatSending ? "#fff" : "#999",
+                    border: "none",
+                    borderRadius: "50%",
+                    width: 30,
+                    height: 30,
+                    cursor: chatInput.trim() && !chatSending ? "pointer" : "default",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                    transition: "background 0.2s",
+                  },
+                },
+                // Send arrow icon
+                React.createElement(
+                  "svg",
+                  {
+                    width: 14,
+                    height: 14,
+                    viewBox: "0 0 24 24",
+                    fill: "none",
+                    stroke: "currentColor",
+                    strokeWidth: 2,
+                    strokeLinecap: "round",
+                    strokeLinejoin: "round",
+                  },
+                  React.createElement("line", { x1: 22, y1: 2, x2: 11, y2: 13 }),
+                  React.createElement("polygon", { points: "22 2 15 22 11 13 2 9 22 2" }),
+                ),
+              ),
+            ),
           )
         : null,
     ),
