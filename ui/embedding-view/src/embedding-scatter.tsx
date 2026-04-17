@@ -39,6 +39,7 @@ interface ViewState {
 }
 
 type WsStatus = "disconnected" | "connecting" | "connected";
+type ToolMode = "pan" | "lasso";
 
 const POINT_RADIUS = 4;
 const HOVER_RADIUS = 8;
@@ -136,6 +137,19 @@ function fitViewToPoints(
   };
 }
 
+// Ray-casting point-in-polygon test (screen coordinates)
+function pointInPolygon(px: number, py: number, poly: { x: number; y: number }[]): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x, yi = poly[i].y;
+    const xj = poly[j].x, yj = poly[j].y;
+    if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
 const STATUS_COLORS: Record<WsStatus, string> = {
   disconnected: "#999",
   connecting: "#f0ad4e",
@@ -153,6 +167,7 @@ function EmbeddingScatter({
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [points, setPoints] = React.useState<EmbeddingPoint[]>([]);
   const [tooltip, setTooltip] = React.useState<TooltipInfo | null>(null);
+  const [dragging, setDragging] = React.useState(false);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [view, setView] = React.useState<ViewState>({
@@ -172,6 +187,10 @@ function EmbeddingScatter({
   const [chatInput, setChatInput] = React.useState("");
   const [chatSending, setChatSending] = React.useState(false);
   const chatListRef = React.useRef<HTMLDivElement>(null);
+  const [toolMode, setToolMode] = React.useState<ToolMode>("pan");
+  const [lassoPath, setLassoPath] = React.useState<{ x: number; y: number }[]>([]);
+  const [lassoSelected, setLassoSelected] = React.useState<Set<number>>(new Set());
+  const lassoDrawing = React.useRef(false);
   const dragRef = React.useRef<{
     startX: number;
     startY: number;
@@ -189,7 +208,7 @@ function EmbeddingScatter({
   const nodePath = segments.join("/");
   const customUrl = `${window.location.origin}/custom/embedding-ui`;
 
-  const canvasWidth = selected || chatOpen
+  const canvasWidth = selected || chatOpen || lassoSelected.size > 0
     ? containerWidth - PANEL_INSET
     : containerWidth;
 
@@ -497,6 +516,7 @@ function EmbeddingScatter({
     }
 
     // Points
+    const hasLasso = lassoSelected.size > 0;
     for (const p of points) {
       const sx = p.x * view.scale + view.offsetX;
       const sy = -p.y * view.scale + view.offsetY;
@@ -509,15 +529,21 @@ function EmbeddingScatter({
         continue;
       const isHovered = tooltip?.point.index === p.index;
       const isSelected = selected?.point.index === p.index;
+      const isLassoed = hasLasso && lassoSelected.has(p.index);
       const radius = isHovered || isSelected ? HOVER_RADIUS : POINT_RADIUS;
       ctx.beginPath();
       ctx.arc(sx, sy, radius, 0, Math.PI * 2);
       ctx.fillStyle = getLabelColor(p.label || "");
-      ctx.globalAlpha = isHovered || isSelected ? 1.0 : 0.7;
+      ctx.globalAlpha = hasLasso && !isLassoed && !isHovered && !isSelected ? 0.15 : (isHovered || isSelected ? 1.0 : 0.7);
       ctx.fill();
       if (isSelected) {
         ctx.strokeStyle = "#1976d2";
         ctx.lineWidth = 2.5;
+        ctx.stroke();
+      } else if (isLassoed) {
+        ctx.globalAlpha = 1.0;
+        ctx.strokeStyle = "#ff6f00";
+        ctx.lineWidth = 1.5;
         ctx.stroke();
       } else if (isHovered) {
         ctx.strokeStyle = "#000";
@@ -526,7 +552,32 @@ function EmbeddingScatter({
       }
     }
     ctx.globalAlpha = 1.0;
-  }, [points, view, canvasWidth, tooltip, selected]);
+
+    // Draw lasso path (stored in data coords, convert to screen)
+    if (lassoPath.length > 1) {
+      ctx.beginPath();
+      const lp0x = lassoPath[0].x * view.scale + view.offsetX;
+      const lp0y = -lassoPath[0].y * view.scale + view.offsetY;
+      ctx.moveTo(lp0x, lp0y);
+      for (let i = 1; i < lassoPath.length; i++) {
+        const lpx = lassoPath[i].x * view.scale + view.offsetX;
+        const lpy = -lassoPath[i].y * view.scale + view.offsetY;
+        ctx.lineTo(lpx, lpy);
+      }
+      if (!lassoDrawing.current && lassoPath.length > 2) {
+        ctx.closePath();
+      }
+      ctx.strokeStyle = "#ff6f00";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (!lassoDrawing.current && lassoPath.length > 2) {
+        ctx.fillStyle = "rgba(255, 111, 0, 0.06)";
+        ctx.fill();
+      }
+    }
+  }, [points, view, canvasWidth, tooltip, selected, lassoPath, lassoSelected]);
 
   // Mouse handlers
   const toDataCoords = React.useCallback(
@@ -536,6 +587,15 @@ function EmbeddingScatter({
       const rect = canvas.getBoundingClientRect();
       return { mx: clientX - rect.left, my: clientY - rect.top };
     },
+    [],
+  );
+
+  // Convert screen coords to data-space coords (inverse of the view transform)
+  const screenToData = React.useCallback(
+    (sx: number, sy: number, v: ViewState) => ({
+      x: (sx - v.offsetX) / v.scale,
+      y: -(sy - v.offsetY) / v.scale,
+    }),
     [],
   );
 
@@ -559,6 +619,17 @@ function EmbeddingScatter({
 
   const handleMouseMove = React.useCallback(
     (e: React.MouseEvent) => {
+      const coords = toDataCoords(e.clientX, e.clientY);
+      if (!coords) return;
+
+      // Lasso drawing
+      if (toolMode === "lasso" && lassoDrawing.current) {
+        const dp = screenToData(coords.mx, coords.my, viewRef.current);
+        setLassoPath((prev) => [...prev, dp]);
+        return;
+      }
+
+      // Pan dragging
       if (dragRef.current) {
         const dx = e.clientX - dragRef.current.startX;
         const dy = e.clientY - dragRef.current.startY;
@@ -570,8 +641,6 @@ function EmbeddingScatter({
         return;
       }
 
-      const coords = toDataCoords(e.clientX, e.clientY);
-      if (!coords) return;
       const p = findPoint(coords.mx, coords.my);
       if (p) {
         const thumbUrl = `${apiUrl}/array/full/${nodePath}/thumbnails?format=image/png&slice=${p.index}`;
@@ -585,50 +654,88 @@ function EmbeddingScatter({
         setTooltip(null);
       }
     },
-    [toDataCoords, findPoint, apiUrl, nodePath],
+    [toDataCoords, findPoint, apiUrl, nodePath, toolMode],
   );
 
   const viewRef = React.useRef(view);
   viewRef.current = view;
 
+  const pointsRef = React.useRef(points);
+  pointsRef.current = points;
+
   const handleMouseDown = React.useCallback(
     (e: React.MouseEvent) => {
+      if (toolMode === "lasso") {
+        const coords = toDataCoords(e.clientX, e.clientY);
+        if (!coords) return;
+        lassoDrawing.current = true;
+        const dp = screenToData(coords.mx, coords.my, viewRef.current);
+        setLassoPath([dp]);
+        setLassoSelected(new Set());
+        return;
+      }
       dragRef.current = {
         startX: e.clientX,
         startY: e.clientY,
         startOffsetX: viewRef.current.offsetX,
         startOffsetY: viewRef.current.offsetY,
       };
+      setDragging(true);
     },
-    [],
+    [toolMode, toDataCoords],
   );
 
   const handleMouseUp = React.useCallback(() => {
+    if (toolMode === "lasso" && lassoDrawing.current) {
+      lassoDrawing.current = false;
+      // Compute which points are inside the lasso polygon
+      const path = lassoPath;
+      if (path.length < 3) {
+        setLassoPath([]);
+        return;
+      }
+      const sel = new Set<number>();
+      for (const p of pointsRef.current) {
+        if (pointInPolygon(p.x, p.y, path)) {
+          sel.add(p.index);
+        }
+      }
+      if (sel.size === 0) {
+        setLassoPath([]);
+      } else {
+        setLassoSelected(sel);
+        // Close detail panel and chat when lasso selects points
+        setSelected(null);
+        setChatOpen(false);
+      }
+      return;
+    }
     dragRef.current = null;
-  }, []);
+    setDragging(false);
+  }, [toolMode, lassoPath]);
 
-  const handleWheel = React.useCallback(
-    (e: React.WheelEvent) => {
-      e.preventDefault();
-      const coords = toDataCoords(e.clientX, e.clientY);
-      if (!coords) return;
-      const factor = e.deltaY > 0 ? 0.9 : 1.1;
-      setView((v) => ({
-        scale: v.scale * factor,
-        offsetX: coords.mx - (coords.mx - v.offsetX) * factor,
-        offsetY: coords.my - (coords.my - v.offsetY) * factor,
-      }));
-    },
-    [toDataCoords],
-  );
+  // Attach mouseup to window so drag release is always caught
+  React.useEffect(() => {
+    const onUp = () => {
+      if (dragRef.current) {
+        dragRef.current = null;
+        setDragging(false);
+      }
+    };
+    window.addEventListener("mouseup", onUp);
+    return () => window.removeEventListener("mouseup", onUp);
+  }, []);
 
   const handleClick = React.useCallback(
     (e: React.MouseEvent) => {
+      // In lasso mode, clicks are handled by mousedown/mouseup
+      if (toolMode === "lasso") return;
       const coords = toDataCoords(e.clientX, e.clientY);
       if (!coords) return;
       const p = findPoint(coords.mx, coords.my);
       if (!p) {
         setSelected(null);
+        // Don't clear lasso on empty click — user must explicitly clear
         return;
       }
       // Close chat when selecting a point (mutual exclusion)
@@ -656,7 +763,22 @@ function EmbeddingScatter({
       });
       setSaveError(null);
     },
-    [toDataCoords, findPoint, apiUrl, nodePath],
+    [toDataCoords, findPoint, apiUrl, nodePath, toolMode],
+  );
+
+  const handleWheel = React.useCallback(
+    (e: React.WheelEvent) => {
+      e.preventDefault();
+      const coords = toDataCoords(e.clientX, e.clientY);
+      if (!coords) return;
+      const factor = e.deltaY > 0 ? 0.9 : 1.1;
+      setView((v) => ({
+        scale: v.scale * factor,
+        offsetX: coords.mx - (coords.mx - v.offsetX) * factor,
+        offsetY: coords.my - (coords.my - v.offsetY) * factor,
+      }));
+    },
+    [toDataCoords],
   );
 
   const handleSave = React.useCallback(async () => {
@@ -747,6 +869,18 @@ function EmbeddingScatter({
     }
   }, [chatMessages]);
 
+  // Escape key clears lasso selection
+  React.useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape" && lassoSelected.size > 0) {
+        setLassoSelected(new Set());
+        setLassoPath([]);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [lassoSelected]);
+
   const uniqueLabels = React.useMemo(() => {
     const labels = new Set<string>();
     for (const p of points) {
@@ -754,6 +888,18 @@ function EmbeddingScatter({
     }
     return Array.from(labels).sort();
   }, [points]);
+
+  // Lasso selection summary
+  const lassoSummary = React.useMemo(() => {
+    if (lassoSelected.size === 0) return null;
+    const selectedPts = points.filter((p) => lassoSelected.has(p.index));
+    const labelCounts: Record<string, number> = {};
+    for (const p of selectedPts) {
+      const lbl = p.label || "(unlabeled)";
+      labelCounts[lbl] = (labelCounts[lbl] || 0) + 1;
+    }
+    return { count: selectedPts.length, labelCounts, points: selectedPts };
+  }, [lassoSelected, points]);
 
   const meta = item?.data?.attributes?.metadata || {};
 
@@ -801,13 +947,81 @@ function EmbeddingScatter({
       meta.embedding_dim
         ? React.createElement("span", null, `Dim: ${meta.embedding_dim}`)
         : null,
+      // Tool mode toggle (Pan / Lasso)
+      React.createElement(
+        "div",
+        {
+          style: {
+            marginLeft: "auto",
+            display: "flex",
+            border: "1px solid #ccc",
+            borderRadius: 12,
+            overflow: "hidden",
+          },
+        },
+        React.createElement(
+          "button",
+          {
+            onClick: () => { setToolMode("pan"); },
+            title: "Pan & zoom (drag to pan)",
+            style: {
+              display: "flex",
+              alignItems: "center",
+              gap: 3,
+              fontSize: 12,
+              background: toolMode === "pan" ? "#e3f2fd" : "none",
+              border: "none",
+              borderRight: "1px solid #ccc",
+              padding: "2px 10px",
+              cursor: "pointer",
+              color: toolMode === "pan" ? "#1976d2" : "#555",
+            },
+          },
+          // Move/pan icon
+          React.createElement(
+            "svg",
+            { width: 12, height: 12, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" },
+            React.createElement("polyline", { points: "5 9 2 12 5 15" }),
+            React.createElement("polyline", { points: "9 5 12 2 15 5" }),
+            React.createElement("polyline", { points: "15 19 12 22 9 19" }),
+            React.createElement("polyline", { points: "19 9 22 12 19 15" }),
+            React.createElement("line", { x1: 2, y1: 12, x2: 22, y2: 12 }),
+            React.createElement("line", { x1: 12, y1: 2, x2: 12, y2: 22 }),
+          ),
+          React.createElement("span", null, "Pan"),
+        ),
+        React.createElement(
+          "button",
+          {
+            onClick: () => { setToolMode("lasso"); },
+            title: "Lasso select (draw to select points)",
+            style: {
+              display: "flex",
+              alignItems: "center",
+              gap: 3,
+              fontSize: 12,
+              background: toolMode === "lasso" ? "#fff3e0" : "none",
+              border: "none",
+              padding: "2px 10px",
+              cursor: "pointer",
+              color: toolMode === "lasso" ? "#ff6f00" : "#555",
+            },
+          },
+          // Lasso icon
+          React.createElement(
+            "svg",
+            { width: 12, height: 12, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" },
+            React.createElement("path", { d: "M7 22a5 5 0 0 1-2-4c0-2 1-3 2-4l8-8c2-2 5-2 7 0s2 5 0 7l-8 8c-1 1-2 2-4 2s-3-1-3-1" }),
+          ),
+          React.createElement("span", null, "Lasso"),
+        ),
+      ),
       // Live status toggle
       React.createElement(
         "button",
         {
           onClick: () => setLiveEnabled((v) => !v),
           style: {
-            marginLeft: "auto",
             display: "flex",
             alignItems: "center",
             gap: 4,
@@ -904,7 +1118,7 @@ function EmbeddingScatter({
         style: {
           width: canvasWidth,
           height: CANVAS_HEIGHT,
-          cursor: dragRef.current ? "grabbing" : "crosshair",
+          cursor: toolMode === "lasso" ? "crosshair" : dragging ? "grabbing" : tooltip ? "pointer" : "grab",
           border: "1px solid #ddd",
           borderRadius: 4,
           display: "block",
@@ -914,6 +1128,7 @@ function EmbeddingScatter({
         onMouseUp: handleMouseUp,
         onMouseLeave: () => {
           dragRef.current = null;
+          setDragging(false);
           setTooltip(null);
         },
         onWheel: handleWheel,
@@ -1419,8 +1634,181 @@ function EmbeddingScatter({
             ),
           )
         : null,
+      // Lasso selection panel — same position as detail/chat panels
+      lassoSummary && !selected && !chatOpen
+        ? React.createElement(
+            "div",
+            {
+              style: {
+                position: "absolute" as const,
+                right: 0,
+                top: 0,
+                width: PANEL_WIDTH,
+                height: CANVAS_HEIGHT,
+                background: "white",
+                border: "1px solid #ccc",
+                borderRadius: 4,
+                boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                fontSize: 13,
+                boxSizing: "border-box" as const,
+                display: "flex",
+                flexDirection: "column" as const,
+              },
+            },
+            // Header
+            React.createElement(
+              "div",
+              {
+                style: {
+                  padding: "10px 16px",
+                  borderBottom: "1px solid #eee",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  flexShrink: 0,
+                },
+              },
+              React.createElement(
+                "span",
+                { style: { fontWeight: 500, color: "#333" } },
+                `${lassoSummary.count} points selected`,
+              ),
+              React.createElement(
+                "button",
+                {
+                  onClick: () => { setLassoSelected(new Set()); setLassoPath([]); },
+                  style: {
+                    background: "none",
+                    border: "none",
+                    fontSize: 12,
+                    color: "#999",
+                    cursor: "pointer",
+                    padding: 0,
+                  },
+                },
+                "Clear",
+              ),
+            ),
+            // Label breakdown
+            React.createElement(
+              "div",
+              {
+                style: {
+                  padding: "10px 16px",
+                  borderBottom: "1px solid #eee",
+                  flexShrink: 0,
+                },
+              },
+              React.createElement(
+                "div",
+                { style: { fontSize: 11, color: "#777", marginBottom: 6 } },
+                "Labels",
+              ),
+              ...Object.entries(lassoSummary.labelCounts)
+                .sort((a, b) => b[1] - a[1])
+                .map(([label, count]) =>
+                  React.createElement(
+                    "div",
+                    {
+                      key: label,
+                      style: {
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        marginBottom: 3,
+                        fontSize: 12,
+                      },
+                    },
+                    React.createElement("div", {
+                      style: {
+                        width: 8,
+                        height: 8,
+                        borderRadius: "50%",
+                        backgroundColor: label === "(unlabeled)" ? "#888" : getLabelColor(label),
+                        flexShrink: 0,
+                      },
+                    }),
+                    React.createElement("span", { style: { flex: 1 } }, label),
+                    React.createElement("span", { style: { color: "#999" } }, String(count)),
+                  ),
+                ),
+            ),
+            // Point list (scrollable)
+            React.createElement(
+              "div",
+              {
+                style: {
+                  flex: 1,
+                  overflowY: "auto" as const,
+                  padding: "8px 16px",
+                },
+              },
+              React.createElement(
+                "div",
+                { style: { fontSize: 11, color: "#777", marginBottom: 6 } },
+                "Points",
+              ),
+              ...lassoSummary.points.map((p) =>
+                React.createElement(
+                  "div",
+                  {
+                    key: p.index,
+                    onClick: () => {
+                      // Switch to pan mode and open detail panel for this point
+                      setToolMode("pan");
+                      setChatOpen(false);
+                      const thumbUrl = `${apiUrl}/array/full/${nodePath}/thumbnails?format=image/png&slice=${p.index}`;
+                      setSelected({
+                        point: p,
+                        thumbnailUrl: thumbUrl,
+                        note: "",
+                        userLabel: "",
+                        originalNote: "",
+                        originalUserLabel: "",
+                        saving: false,
+                      });
+                      Promise.all([
+                        fetchStringValue(apiUrl, nodePath, "notes", p.index),
+                        fetchStringValue(apiUrl, nodePath, "user_labels", p.index),
+                      ]).then(([note, userLabel]) => {
+                        setSelected((prev) =>
+                          prev && prev.point.index === p.index
+                            ? { ...prev, note, userLabel, originalNote: note, originalUserLabel: userLabel }
+                            : prev,
+                        );
+                      });
+                    },
+                    style: {
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      padding: "3px 4px",
+                      borderRadius: 3,
+                      cursor: "pointer",
+                      fontSize: 12,
+                      marginBottom: 1,
+                    },
+                    onMouseEnter: (e: React.MouseEvent<HTMLDivElement>) => {
+                      (e.currentTarget as HTMLDivElement).style.background = "#f5f5f5";
+                    },
+                    onMouseLeave: (e: React.MouseEvent<HTMLDivElement>) => {
+                      (e.currentTarget as HTMLDivElement).style.background = "none";
+                    },
+                  },
+                  React.createElement("span", { style: { color: "#1976d2" } }, `#${p.index}`),
+                  p.label
+                    ? React.createElement(
+                        "span",
+                        { style: { color: getLabelColor(p.label), fontSize: 11 } },
+                        p.label,
+                      )
+                    : null,
+                ),
+              ),
+            ),
+          )
+        : null,
     ),
-    // Legend
     uniqueLabels.length > 0
       ? React.createElement(
           "div",
@@ -1457,7 +1845,7 @@ function EmbeddingScatter({
     React.createElement(
       "div",
       { style: { marginTop: 6, fontSize: 11, color: "#999" } },
-      "Scroll to zoom. Drag to pan. Click point to inspect and annotate.",
+      "Scroll to zoom. Pan mode: drag to pan, click point to inspect. Lasso mode: draw to select points.",
     ),
   );
 }
