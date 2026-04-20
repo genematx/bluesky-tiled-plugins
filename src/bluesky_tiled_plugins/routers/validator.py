@@ -19,6 +19,7 @@ from tiled.server.authentication import (
     get_current_scopes,
     get_session_state,
 )
+from tiled.catalog.adapter import CatalogArrayAdapter, CatalogTableAdapter
 from tiled.server.settings import Settings, get_settings
 from tiled.server.schemas import Principal
 
@@ -53,8 +54,8 @@ async def validate_entry_structure(
         If True, attempt to correct any structural issues in the data sources.
     ignore_errors: list[str], optional
         A list of (parts of) error messages to ignore during validation. If an error message
-        matches any in this list, it will not cause the validation to fail, and its details
-        will not be included in the returned notes.
+        matches any in this list, it will be included in the notes, but the validation for
+        the remaining data sources will continue.
 
     Returns:
     -------
@@ -107,11 +108,69 @@ async def validate_entry_structure(
     return True, notes
 
 
+async def validate_entry_reading(entry, ignore_errors=None):
+    """Validate that data can be read from all arrays and tables in the given entry.
+
+    Parameters
+    ----------
+    entry: Entry
+        The entry whose data should be validated for reading.
+    ignore_errors: list[str], optional
+        A list of (parts of) error messages to ignore during validation. If an error message
+        matches any in this list, it will be included in the notes, but the validation for
+        the remaining data will continue.
+    """
+
+    notes = []
+    ignore_errors = ignore_errors or []
+    for stream_name, stream_node in await entry.items_range(0, None):
+        for dkey_name, dkey_node in await stream_node.items_range(0, None):
+            if isinstance(dkey_node, CatalogArrayAdapter):
+                # Try to read the first and last elements of the array
+                try:
+                    shape = dkey_node.structure().shape
+                    idx_left_top = (0,) * len(shape)
+                    await dkey_node.read(slice=idx_left_top)
+                    idx_right_bottom = (-1,) * len(shape)
+                    await dkey_node.read(slice=idx_right_bottom)
+                except Exception as e:
+                    msg = f"Error while reading '{stream_name}/{dkey_name}': {e}"
+                    if any(re.search(msg, str(e)) for msg in ignore_errors):
+                        notes.append(msg)
+                        continue
+
+                    raise HTTPException(
+                        status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=msg
+                    )
+
+            elif isinstance(dkey_node, CatalogTableAdapter):
+                # Try to read the entire table
+                try:
+                    await dkey_node.read()
+                except Exception as e:
+                    msg = f"Error while reading '{stream_name}/{dkey_name}': {e}"
+                    if any(re.search(msg, str(e)) for msg in ignore_errors):
+                        notes.append(msg)
+                        continue
+
+                    raise HTTPException(
+                        status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=msg
+                    )
+
+    return True, notes
+
+
 @router.get("/validate/{path:path}")
-async def validate_structure_operation(
+async def get_validate_operation(
     path: str,
     request: Request,
-    fix: bool = Query(False, description="Attempt to correct structure to match data."),
+    fix: Optional[bool] = Query(
+        False, description="Attempt to correct structure to match data."
+    ),
+    read: Optional[bool] = Query(
+        False,
+        description="Attempt to read data from each data source to validate access and integrity.",
+    ),
     settings: Settings = Depends(get_settings),
     principal: Optional[Principal] = Depends(get_current_principal),
     root_tree=Depends(get_root_tree),
@@ -139,17 +198,29 @@ async def validate_structure_operation(
             detail=f"Entry at path '{path}' does not have a BlueskyRun spec; cannot validate.",
         )
 
+    # First validate the structure of the data sources
     valid, notes = await validate_entry_structure(entry, fix=fix)
+
+    # If structure is valid and reading validation is requested, validate reading
+    if valid and read:
+        valid, _notes = await validate_entry_reading(entry)
+        notes.extend(_notes)
 
     return ValidationResponse(valid=valid, notes=notes)
 
 
 @router.post("/validate/{path:path}")
-async def validate_structure_operation_post(
+async def post_validate_operation(
     path: str,
     body: PostValidationRequest,
     request: Request,
-    fix: bool = Query(False, description="Attempt to correct structure to match data."),
+    fix: Optional[bool] = Query(
+        False, description="Attempt to correct structure to match data."
+    ),
+    read: Optional[bool] = Query(
+        False,
+        description="Attempt to read data from each data source to validate access and integrity.",
+    ),
     settings: Settings = Depends(get_settings),
     principal: Optional[Principal] = Depends(get_current_principal),
     root_tree=Depends(get_root_tree),
@@ -158,7 +229,7 @@ async def validate_structure_operation_post(
     authn_scopes: Scopes = Depends(get_current_scopes),
     _=Security(check_scopes, scopes=["read:data", "read:metadata", "write:metadata"]),
 ):
-    # POST version of the same endpoint, to allow for longer query parameters (e.g. ignore_errors)
+    # POST version of the same endpoint, to allow for longer parameters (e.g. ignore_errors)
     entry = await get_entry(
         path,
         ["read:data", "read:metadata", "write:metadata"],
@@ -178,8 +249,16 @@ async def validate_structure_operation_post(
             detail=f"Entry at path '{path}' does not have a BlueskyRun spec; cannot validate.",
         )
 
+    # First validate the structure of the data sources, with any specified ignored errors
     valid, notes = await validate_entry_structure(
         entry, fix=fix, ignore_errors=body.ignore_errors
     )
+
+    # If structure is valid and reading validation is requested, validate reading
+    if valid and read:
+        valid, _notes = await validate_entry_reading(
+            entry, ignore_errors=body.ignore_errors
+        )
+        notes.extend(_notes)
 
     return ValidationResponse(valid=valid, notes=notes)

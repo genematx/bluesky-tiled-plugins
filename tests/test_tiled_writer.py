@@ -24,6 +24,7 @@ from event_model.documents.event_descriptor import DataKey
 from event_model.documents.stream_datum import StreamDatum
 from event_model.documents.stream_resource import StreamResource
 from tiled.client import record_history
+from tiled.utils import safe_json_dump
 from examples.render import render_templated_documents
 
 from bluesky_tiled_plugins import TiledWriter
@@ -493,7 +494,6 @@ def test_ignore_validation_errors(client, external_assets_folder, ignore_errors)
         if name == "stream_resource":
             doc["uri"] += "_"
 
-        #
         if name == "stop":
             if ignore_errors:
                 tw(name, doc)  # Should not raise due to ignored error
@@ -510,6 +510,44 @@ def test_ignore_validation_errors(client, external_assets_folder, ignore_errors)
         assert run.stop is not None
     else:
         assert "stop" not in run.metadata
+
+    with pytest.raises(Exception):
+        run["primary"].read()
+
+
+@pytest.mark.parametrize("ignore_errors", (None, ["FileNotFoundError"]))
+@pytest.mark.parametrize("fname", ["internal_events", "external_assets"])
+def test_validate_reading(client, external_assets_folder, fname, ignore_errors):
+    # NOTE: This is mainly just a smoke test
+    tw = TiledWriter(client, validate=False, ignore_errors=ignore_errors)
+
+    documents = render_templated_documents(fname + ".json", external_assets_folder)
+    for item in documents:
+        name, doc = item["name"], item["doc"]
+        if name == "start":
+            uid = doc["uid"]
+
+        tw(name, doc)
+
+    # Check that the data has been written
+    assert uid in client
+    run_client = client[uid]
+    assert run_client.stop is not None
+
+    # Trigger the reading validation via the GET API
+    response = run_client.context.http_client.get(
+        run_client.uri.replace("/metadata/", "/validate/", 1),
+        params={"fix": True, "read": True},
+    )
+    assert response is not None
+
+    # Trigger the reading validation via the POST API with ignore_errors parameter
+    response = run_client.context.http_client.post(
+        run_client.uri.replace("/metadata/", "/validate/", 1),
+        params={"fix": True, "read": True},
+        content=safe_json_dump({"ignore_errors": ignore_errors}),
+    )
+    assert response is not None
 
 
 @pytest.mark.parametrize("squeeze", [True, False])
