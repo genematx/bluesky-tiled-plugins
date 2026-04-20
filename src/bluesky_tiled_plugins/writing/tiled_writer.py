@@ -5,8 +5,11 @@ from collections import defaultdict, deque, namedtuple
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+import re
+from typing import Any, Optional, cast
+import warnings
 
+import httpx
 import numpy
 import pyarrow
 from event_model import (
@@ -45,6 +48,7 @@ from packaging.version import Version
 from ..utils import truncate_json_overflow
 from ._dispatcher import Dispatcher
 from ._json_writer import JSONLinesWriter
+from .validator import ValidationException
 from .consolidators import (
     ConsolidatorBase,
     DataSource,
@@ -106,12 +110,6 @@ MIMETYPE_LOOKUP = defaultdict(
 )
 
 logger = logging.getLogger(__name__)
-
-
-class ValidationError(Exception):
-    """Custom exception for validation errors in Tiled RunWriter."""
-
-    pass
 
 
 def concatenate_stream_datums(*docs: StreamDatum):
@@ -295,6 +293,10 @@ class RunNormalizer(DocumentRouter):
                 stream_resource_doc["parameters"]["dataset"] = (
                     existing_dataset or "/entry/instrument/detector/data"
                 )
+
+        # Rename "frame_per_point" to a more recent (yet also deprecated) "multiplier"
+        if val := stream_resource_doc["parameters"].pop("frame_per_point", None):
+            stream_resource_doc["parameters"]["multiplier"] = val
 
         # Ensure that the internal path within HDF5 files is referenced with "dataset" parameter
         if stream_resource_doc["mimetype"] == "application/x-hdf5":
@@ -628,6 +630,7 @@ class _RunWriter(DocumentRouter):
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
         validate: bool = False,
+        ignore_errors: Optional[list[str]] = None,
     ):
         """Write documents from a single Bluesky Run into Tiled.
 
@@ -671,6 +674,7 @@ class _RunWriter(DocumentRouter):
             max_array_size  # Max size of arrays to write to tabular storage
         )
         self._validate: bool = validate
+        self.ignore_errors = ignore_errors or []
         self.data_keys: dict[str, DataKey] = {}
         self.access_tags: list[str] | None = None
         self.notes: list[str] = []
@@ -703,7 +707,7 @@ class _RunWriter(DocumentRouter):
             if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):
                 metadata = truncate_json_overflow(self.data_keys.get(key, {}))
                 arr_client = desc_node.write_array(
-                    numpy.array(arr_lst),
+                    numpy.array(arr_lst, dtype=metadata.get("dtype_numpy", None)),
                     key=key,
                     metadata=metadata,
                     dims=("time", "dim_1"),  # Always 2D
@@ -715,7 +719,9 @@ class _RunWriter(DocumentRouter):
                 )
             else:
                 arr_client.patch(
-                    numpy.array(arr_lst), offset=arr_client.shape[:1], extend=True
+                    numpy.array(arr_lst, dtype=arr_client.dtype),
+                    offset=arr_client.shape[:1],
+                    extend=True,
                 )
 
         # 2. Write internal tabular data; all data_keys for arrays have been removed from data_cache on step 1
@@ -762,9 +768,8 @@ class _RunWriter(DocumentRouter):
         self, node: BaseClient, data_source: DataSource, patch: Patch | None = None
     ):
         """Update DataSource of the node in Tiled corresponding to the StreamResource"""
-        data_source.id = node.data_sources()[
-            0
-        ].id  # ID of the existing DataSource record
+        # Get and set the ID of the existing DataSource record
+        data_source.id = node.data_sources()[0].id
 
         # Backompatibility: if the server is older than 0.2.4,
         # it can not accept the "properties" field in the data source.
@@ -834,27 +839,106 @@ class _RunWriter(DocumentRouter):
                 sres_node, consolidator.get_data_source(), patch=final_patch
             )
 
-        # Validate structure for some StreamResource nodes, select unique pairs of (sres_node, consolidator)
+        # Select unique pairs of (sres_node, consolidator)
         node_and_cons = {
             (sres_node, self._consolidators[sres_uid])
             for sres_uid, sres_node in self._sres_nodes.items()
         }
+        # If there is any metadata on this consolidator (e.g. `frame_per_point`), update the node
+        for sres_node, consolidator in node_and_cons:
+            if cons_md := consolidator.metadata:
+                sres_node.update_metadata(metadata=cons_md, drop_revision=True)
+
+        # Validate the Structure of the data for each external resource, if requested
+        # Try validating directly on the server, first; if endpoint is not available, do it locally
         if self._validate:
-            for sres_node, consolidator in node_and_cons:
-                title = f"Validation of data key '{sres_node.item['id']}'"
-                try:
-                    _notes = consolidator.validate(fix_errors=True)
-                    self.notes.extend([title + ": " + note for note in _notes])
-                except Exception as e:
-                    msg = (
-                        f"{type(e).__name__}: "
-                        + str(e).replace("\n", " ").replace("\r", "").strip()
+            for attempt in retry_context():
+                with attempt:
+                    response = self.root_node.context.http_client.post(
+                        self.root_node.uri.replace("/metadata/", "/validate/", 1),
+                        params={"fix": True},
+                        content=safe_json_dump({"ignore_errors": self.ignore_errors}),
                     )
-                    msg = title + f" failed with error: {msg}"
-                    raise ValidationError(msg) from e
-                self._update_data_source_for_node(
-                    sres_node, consolidator.get_data_source()
-                )
+
+            try:
+                content = handle_error(response).json()
+                _notes = content.get("notes", [])
+                if content.get("valid"):
+                    logger.info("Remote validation successful for all external data.")
+                    self.notes.extend(_notes)
+                    for note in _notes:
+                        warnings.warn(note, stacklevel=2)
+                else:
+                    msg = "Remote validation failed: " + "; ".join(_notes)
+                    raise ValidationException(msg, self.root_node.item["id"])
+
+            except httpx.HTTPStatusError as e:
+                # Backcompatibility: if the server does not support validation endpoint,
+                # it will return 404 Not Found error; in this case, attempt to validate
+                # the data structure locally with the Consolidator.
+
+                if response.status_code == httpx.codes.NOT_FOUND:
+                    warnings.warn(
+                        "Tiled server does not support remote validation. "
+                        "Attempting to validate the data structure locally."
+                    )
+                    for sres_node, consolidator in node_and_cons:
+                        title = f"Validation of '{sres_node.item['id']}'"
+                        try:
+                            _notes = consolidator.validate(fix_errors=True)
+                            self.notes.extend([title + ": " + note for note in _notes])
+                        except FileNotFoundError as e:
+                            if (e.filename is not None) and Path(e.filename).parent.exists():
+                                msg = title + f" failed with error: {e.filename} is not found, " \
+                                    + "but its parent directory exists and is readable."
+                                self.notes.append(msg)
+                                logger.error(msg + " Continuing validation.")
+                            elif e.filename is None:
+                                if 'No such file or directory' in str(e):
+                                    if m := re.search(r":\s*'([^']+)'$", str(e)):
+                                        fpath = m.group(1)
+                                        if (not Path(fpath).exists()) and Path(fpath).parent.exists():
+                                            msg = title + f" failed with error: {fpath} is not found, " \
+                                                + "but its parent directory exists and is readable."
+                                            self.notes.append(msg)
+                                            logger.error(msg + " Continuing validation.")
+                                elif any(re.search(ptrn, str(e)) for ptrn in self.ignore_errors):
+                                    warnings.warn("Ignored validation error: " + str(e) + " Continuing validation.")
+                                else:
+                                    msg = title + f" failed with error: {e}"
+                                    raise ValidationException(msg, sres_node.item["id"]) from e
+                            elif any(re.search(ptrn, str(e)) for ptrn in self.ignore_errors):
+                                warnings.warn("Ignored validation error: " + str(e) + " Continuing validation.")
+                            else:
+                                msg = title + f" failed with error: neither {e.filename}, " \
+                                    + "nor its parent directory exist. Cannot continue validation."
+                                raise ValidationException(msg, sres_node.item["id"]) from e
+                        except Exception as e:
+                            msg = (
+                                f"{type(e).__name__}: "
+                                + str(e).replace("\n", " ").replace("\r", "").strip()
+                            )
+                            msg = title + f" failed with error: {msg}"
+                            if "PCAP.TS_TRIG.Value" in str(e):
+                                logger.warning(msg + " Continuing validation.")
+                            elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
+                                ("out of bounds for axis 1 with size " in msg and "xs_settings_" in msg):
+                                logger.warning(msg + " Continuing validation.")
+                            elif any(re.search(ptrn, msg) for ptrn in self.ignore_errors):
+                                warnings.warn(msg)
+                            else:
+                                raise ValidationException(msg, sres_node.item["id"]) from e
+
+                        self._update_data_source_for_node(
+                            sres_node, consolidator.get_data_source()
+                        )
+
+                else:
+                    msg = (
+                        "Remote validation request failed with status code "
+                        f"{response.status_code}: {response.text}"
+                    )
+                    raise ValidationException(msg, self.root_node.item["id"]) from e
 
         # Write the stop document to the metadata, include notes from the normalizer, if any
         notes = doc.pop("_run_normalizer_notes", []) + self.notes
@@ -1026,6 +1110,7 @@ class TiledWriter:
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
         validate: bool = False,
+        ignore_errors: Optional[list[str]] = None,
     ):
         """Callback for write metadata and data from Bluesky documents into Tiled.
 
@@ -1079,6 +1164,7 @@ class TiledWriter:
         self._batch_size = batch_size
         self._max_array_size = max_array_size
         self._validate = validate
+        self.ignore_errors = ignore_errors or []
 
     def _factory(self, name, doc):
         """Factory method to create a callback for writing a single run into Tiled."""
@@ -1087,6 +1173,7 @@ class TiledWriter:
             batch_size=self._batch_size,
             max_array_size=self._max_array_size,
             validate=self._validate,
+            ignore_errors=self.ignore_errors,
         )
 
         if self._normalizer:
