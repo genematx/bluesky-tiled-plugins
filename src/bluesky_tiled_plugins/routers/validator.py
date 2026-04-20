@@ -102,7 +102,7 @@ async def validate_entry_structure(
                         )
 
                     # If the data source was modified during validation, update it on the server
-                    if _notes:
+                    if _notes or (data_source != valid_data_source):
                         await dkey_node.put_data_source(valid_data_source, patch=None)
 
     return True, notes
