@@ -109,6 +109,7 @@ class ConsolidatorBase:
             Asset(data_uri=self.uri, is_directory=False, parameter="data_uris", num=0)
         ]
         self._sres_parameters = stream_resource["parameters"]
+        self._indx_offset = 0  # To reset file index for each new StreamResource
 
         # Any metadata to be set on the corresponding node in Tiled
         self.metadata: dict = {}
@@ -631,7 +632,7 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
 
         if self.template:
             assert os.path.splitext(self.template)[1] in self.permitted_extensions
-            return self.uri + self.template.format(indx)
+            return self.uri + self.template.format(indx - self._indx_offset)
         return self.uri
 
     def consume_stream_datum(self, doc: StreamDatum):
@@ -660,7 +661,7 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
                 data_uri=new_datum_uri,
                 is_directory=False,
                 parameter="data_uris",
-                num=len(self.assets) + 1,
+                num=len(self.assets),
             )
             self.assets.append(new_asset)
             self.data_uris.append(new_datum_uri)
@@ -674,6 +675,8 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         self.template = self._compile_template(
             self._sres_parameters["template"], self._sres_parameters.get("filename", "")
         )
+        # Reset the file index counter to start from "0" for the new StreamResource template
+        self._indx_offset = len(self.assets)
 
 
 class TIFFConsolidator(MultipartRelatedConsolidator):
