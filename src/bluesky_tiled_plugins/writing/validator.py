@@ -20,7 +20,6 @@ from ..utils import list_summands
 
 logger = logging.getLogger(__name__)
 
-
 class ValidationException(Exception):
     def __init__(self, message, uid=None):
         super().__init__(message)
