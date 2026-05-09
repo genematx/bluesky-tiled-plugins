@@ -180,6 +180,11 @@ def test_validate_reading_table_success(client):
     assert validate_reading(table_client) is None
 
 
+@pytest.mark.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    match="Tiled server does not support remote validation",
+)
 def test_validate_bluesky_run_success(client, external_assets_folder):
     tw = TiledWriter(client, validate=False)  # Do not validate on write (default)
 
@@ -198,6 +203,10 @@ def test_validate_bluesky_run_success(client, external_assets_folder):
     assert validate(client[uid]) is True
 
     # There should be no validation notes since everything is correct
+    assert client[uid].metadata.get("notes") is None
+
+    # Try validation using the method on the client
+    assert client[uid].validate() is True
     assert client[uid].metadata.get("notes") is None
 
 
