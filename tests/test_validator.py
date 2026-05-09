@@ -6,6 +6,7 @@ from tiled.client.dataframe import DataFrameClient
 
 from bluesky_tiled_plugins import TiledWriter
 from bluesky_tiled_plugins.writing.validator import (
+    ValidationException,
     validate_reading,
     validate_structure,
     validate,
@@ -210,7 +211,15 @@ def test_validate_bluesky_run_success(client, external_assets_folder):
     assert client[uid].metadata.get("notes") is None
 
 
-def test_validate_bluesky_run_failure(client, external_assets_folder):
+@pytest.mark.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    match="Tiled server does not support remote validation",
+)
+@pytest.mark.parametrize("use_client_method", [False, True])
+def test_validate_bluesky_run_failure(
+    client, external_assets_folder, use_client_method
+):
     tw = TiledWriter(client, validate=False)  # Do not validate on write (default)
 
     # Write documents with an introduced shape error
@@ -228,14 +237,24 @@ def test_validate_bluesky_run_failure(client, external_assets_folder):
 
         tw(name, doc)  # Write the document
 
-    # Run the full validation, which should fail/raise
-    with pytest.raises(StructureValidationException, match="Shape mismatch"):
-        validate(client[uid], fix_errors=False, raise_on_error=True)
-
-    assert validate(client[uid], fix_errors=False, raise_on_error=False) is False
+    # Run the full validation, which should fail/raise (remote validator raises a generic ValidationException,
+    # while the local validator raises a more specific StructureValidationException)
+    if use_client_method:
+        with pytest.raises(
+            (StructureValidationException, ValidationException), match="Shape mismatch"
+        ):
+            client[uid].validate(fix_errors=False, raise_on_error=True)
+        assert client[uid].validate(fix_errors=False, raise_on_error=False) is False
+    else:
+        with pytest.raises(StructureValidationException, match="Shape mismatch"):
+            validate(client[uid], fix_errors=False, raise_on_error=True)
+        assert validate(client[uid], fix_errors=False, raise_on_error=False) is False
 
     # Now run validation with fixing enabled
-    assert validate(client[uid], fix_errors=True) is True
+    if use_client_method:
+        assert client[uid].validate(fix_errors=True) is True
+    else:
+        assert validate(client[uid], fix_errors=True) is True
 
     # There should be validation notes about the fixes applied
     notes = client[uid].metadata.get("notes", [])
