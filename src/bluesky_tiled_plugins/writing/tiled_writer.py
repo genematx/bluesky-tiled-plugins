@@ -398,13 +398,13 @@ class RunNormalizer(DocumentRouter):
         return sres_doc, sdat_doc
 
     def start(self, doc: RunStart):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         if patch := self.patches.get("start"):
             doc = patch(doc)
         self.emit(DocumentNames.start, doc)
 
     def stop(self, doc: RunStop):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         if patch := self.patches.get("stop"):
             doc = patch(doc)
 
@@ -559,7 +559,7 @@ class RunNormalizer(DocumentRouter):
                 self._ext_ref_cache.append(missing)
 
     def resource(self, doc: Resource):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         if patch := self.patches.get("resource"):
             doc = patch(doc)
 
@@ -571,7 +571,7 @@ class RunNormalizer(DocumentRouter):
         self._sres_cache[doc["uid"]] = self._convert_resource_to_stream_resource(doc)
 
     def stream_resource(self, doc: StreamResource):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         if patch := self.patches.get("stream_resource"):
             doc = patch(doc)
 
@@ -580,13 +580,13 @@ class RunNormalizer(DocumentRouter):
         self.emit(DocumentNames.stream_resource, doc)
 
     def stream_datum(self, doc: StreamDatum):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         if patch := self.patches.get("stream_datum"):
             doc = patch(doc)
         self.emit(DocumentNames.stream_datum, doc)
 
     def datum(self, doc: Datum):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         # Mark the Datum document with the spec of the corresponding Resource, if known
         if spec := self._specs_by_resource_uid.get(doc["resource"]):
             doc["datum_kwargs"] = doc.get("datum_kwargs", {}) | {"_resource_spec": spec}
@@ -851,101 +851,87 @@ class _RunWriter(DocumentRouter):
 
         # Validate the Structure of the data for each external resource, if requested
         # Try validating directly on the server, first; if endpoint is not available, do it locally
-        if self._validate:
-            for attempt in retry_context():
-                with attempt:
-                    response = self.root_node.context.http_client.post(
-                        self.root_node.uri.replace(
-                            "/api/v1/metadata/", "/custom/validate/", 1
-                        ),
-                        params={"fix": True},
-                        content=safe_json_dump({"ignore_errors": self.ignore_errors}),
-                    )
-
-            try:
-                content = handle_error(response).json()
-                _notes = content.get("notes", [])
-                if content.get("valid"):
-                    logger.info("Remote validation successful for all external data.")
-                    self.notes.extend(_notes)
-                    for note in _notes:
-                        warnings.warn(note, stacklevel=2)
-                else:
-                    msg = "Remote validation failed: " + "; ".join(_notes)
-                    raise ValidationException(msg, self.root_node.item["id"])
-
-            except httpx.HTTPStatusError as e:
-                # Backcompatibility: if the server does not support validation endpoint,
-                # it will return 404 Not Found error; in this case, attempt to validate
-                # the data structure locally with the Consolidator.
-
-                if response.status_code == httpx.codes.NOT_FOUND:
-                    warnings.warn(
-                        "Tiled server does not support remote validation. "
-                        "Attempting to validate the data structure locally."
-                    )
-                    for sres_node, consolidator in node_and_cons:
-                        title = f"Validation of '{sres_node.item['id']}'"
-                        try:
-                            _notes = consolidator.validate(fix_errors=True)
-                            self.notes.extend([title + ": " + note for note in _notes])
-                        except FileNotFoundError as e:
-                            if (e.filename is not None) and Path(e.filename).parent.exists():
-                                msg = title + f" failed with error: {e.filename} is not found, " \
-                                    + "but its parent directory exists and is readable."
-                                self.notes.append(msg)
-                                logger.error(msg + " Continuing validation.")
-                            elif e.filename is None:
-                                if 'No such file or directory' in str(e):
-                                    if m := re.search(r":\s*'([^']+)'$", str(e)):
-                                        fpath = m.group(1)
-                                        if (not Path(fpath).exists()) and Path(fpath).parent.exists():
-                                            msg = title + f" failed with error: {fpath} is not found, " \
-                                                + "but its parent directory exists and is readable."
-                                            self.notes.append(msg)
-                                            logger.error(msg + " Continuing validation.")
-                                elif any(re.search(ptrn, str(e)) for ptrn in self.ignore_errors):
-                                    warnings.warn("Ignored validation error: " + str(e) + " Continuing validation.")
-                                else:
-                                    msg = title + f" failed with error: {e}"
-                                    raise ValidationException(msg, sres_node.item["id"]) from e
-                            elif any(re.search(ptrn, str(e)) for ptrn in self.ignore_errors):
-                                warnings.warn("Ignored validation error: " + str(e) + " Continuing validation.")
-                            else:
-                                msg = title + f" failed with error: neither {e.filename}, " \
-                                    + "nor its parent directory exist. Cannot continue validation."
-                                raise ValidationException(msg, sres_node.item["id"]) from e
-                        except Exception as e:
-                            msg = (
-                                f"{type(e).__name__}: "
-                                + str(e).replace("\n", " ").replace("\r", "").strip()
-                            )
-                            msg = title + f" failed with error: {msg}"
-                            if "PCAP.TS_TRIG.Value" in str(e):
-                                logger.warning(msg + " Continuing validation.")
-                            elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
-                                ("out of bounds for axis 1 with size " in msg and "xs_settings_" in msg):
-                                logger.warning(msg + " Continuing validation.")
-                            elif any(re.search(ptrn, msg) for ptrn in self.ignore_errors):
-                                warnings.warn(msg)
-                            else:
-                                raise ValidationException(msg, sres_node.item["id"]) from e
-
-                        self._update_data_source_for_node(
-                            sres_node, consolidator.get_data_source()
+        try:
+            if self._validate:
+                for attempt in retry_context():
+                    with attempt:
+                        response = self.root_node.context.http_client.post(
+                            self.root_node.uri.replace(
+                                "/api/v1/metadata/", "/custom/validate/", 1
+                            ),
+                            params={"fix": True},
+                            content=safe_json_dump(
+                                {"ignore_errors": self.ignore_errors}
+                            ),
                         )
 
-                else:
-                    msg = (
-                        "Remote validation request failed with status code "
-                        f"{response.status_code}: {response.text}"
-                    )
-                    raise ValidationException(msg, self.root_node.item["id"]) from e
+                try:
+                    content = handle_error(response).json()
+                    _notes = content.get("notes", [])
+                    if content.get("valid"):
+                        self.notes.extend(_notes)
+                        for note in _notes:
+                            warnings.warn("Remote validation: " + note, stacklevel=2)
+                        if not _notes:
+                            logger.info(
+                                "Remote validation successful for all external data."
+                            )
+                    else:
+                        msg = "Remote validation failed: " + "; ".join(_notes)
+                        raise ValidationException(msg, self.root_node.item["id"])
 
-        # Write the stop document to the metadata, include notes from the normalizer, if any
-        notes = doc.pop("_run_normalizer_notes", []) + self.notes
-        md_update = {"stop": doc, **({"notes": notes} if notes else {})}
-        self.root_node.update_metadata(metadata=md_update, drop_revision=True)
+                except httpx.HTTPStatusError as e:
+                    # Backcompatibility: if the server does not support validation endpoint,
+                    # it will return 404 Not Found error; in this case, attempt to validate
+                    # the data structure locally with the Consolidator.
+
+                    if response.status_code == httpx.codes.NOT_FOUND:
+                        warnings.warn(
+                            "Tiled server does not support remote validation. "
+                            "Attempting to validate the data structure locally."
+                        )
+                        for sres_node, consolidator in node_and_cons:
+                            title = f"Validation of '{sres_node.item['id']}'"
+                            try:
+                                _notes = consolidator.validate(fix_errors=True)
+                                self.notes.extend(
+                                    [title + ": " + note for note in _notes]
+                                )
+                            except Exception as e:
+                                msg = (
+                                    f"{type(e).__name__}: "
+                                    + str(e)
+                                    .replace("\n", " ")
+                                    .replace("\r", "")
+                                    .strip()
+                                )
+                                msg = title + f" failed with error: {msg}"
+                                if any(
+                                    re.search(ptrn, msg) for ptrn in self.ignore_errors
+                                ):
+                                    warnings.warn(msg)
+                                else:
+                                    raise ValidationException(
+                                        msg, sres_node.item["id"]
+                                    ) from e
+                            self._update_data_source_for_node(
+                                sres_node, consolidator.get_data_source()
+                            )
+                    else:
+                        msg = (
+                            "Remote validation request failed with status code "
+                            f"{response.status_code}: {response.text}"
+                        )
+                        raise ValidationException(msg, self.root_node.item["id"]) from e
+
+        except Exception:
+            raise
+
+        finally:
+            # Write the stop document to the metadata, include any notes from normalizer
+            notes = doc.pop("_run_normalizer_notes", []) + self.notes
+            md_update = {"stop": doc, **({"notes": notes} if notes else {})}
+            self.root_node.update_metadata(metadata=md_update, drop_revision=True)
 
     def descriptor(self, doc: EventDescriptor):
         desc_name = doc["name"]  # Name of the descriptor/stream
@@ -1114,7 +1100,7 @@ class TiledWriter:
         validate: bool = False,
         ignore_errors: Optional[list[str]] = None,
     ):
-        """Callback for write metadata and data from Bluesky documents into Tiled.
+        """Callback for writing metadata and data from Bluesky documents into Tiled.
 
         This callback relies on the `RunRouter` to route documents from one or more runs into
         independent instances of the `_RunWriter` callback. The `RunRouter` is responsible for
@@ -1154,7 +1140,7 @@ class TiledWriter:
             to Tiled immediately after they are received.
         validate : bool
             If True, validate all data sources before writing to Tiled. This requires the access to the
-            files on the client.
+            files on the client or remote validation endpoint to be enabled on the server.
         """
 
         self.client = client.include_data_sources()

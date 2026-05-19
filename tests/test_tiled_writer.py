@@ -503,16 +503,15 @@ def test_ignore_validation_errors(client, external_assets_folder, ignore_errors)
         else:
             tw(name, doc)
 
-    # Check that the data has been written, but is not readable due to the corrupted URI
+    # Check that the data has been written
     assert uid in client
-    run = client[uid]
-    if ignore_errors:
-        assert run.stop is not None
-    else:
-        assert "stop" not in run.metadata
 
+    # The run should have a stop document
+    assert client[uid].stop is not None
+
+    # The data would not be readable due to the wrong URI
     with pytest.raises(Exception):
-        run["primary"].read()
+        client[uid]["primary"].read()
 
 
 @pytest.mark.parametrize("ignore_errors", (None, ["FileNotFoundError"]))

@@ -64,7 +64,7 @@ test = [
   "pytest >=6",
   "pytest-cov >=3",
   "tifffile",
-  "tiled[server] >=0.2.0",
+  "tiled[server] >=0.2.9",
 ]
 dev = [
   { include-group = "test" },
@@ -99,6 +99,9 @@ addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = true
 filterwarnings = [
   "error",
+  # opentelemetry uses an older importlib_metadata dict API that is deprecated;
+  # this is a third-party issue not in our control.
+  "ignore:SelectableGroups dict interface is deprecated:DeprecationWarning",
 ]
 log_level = "INFO"
 testpaths = [
