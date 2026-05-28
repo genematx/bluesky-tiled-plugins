@@ -20,6 +20,7 @@ from tiled.server.authentication import (
     get_session_state,
 )
 from tiled.catalog.adapter import CatalogArrayAdapter, CatalogTableAdapter
+from tiled.ndslice import NDSlice
 from tiled.server.settings import Settings, get_settings
 from tiled.server.schemas import Principal
 
@@ -129,9 +130,9 @@ async def validate_entry_reading(entry, ignore_errors=None):
                 # Try to read the first and last elements of the array
                 try:
                     shape = dkey_node.structure().shape
-                    idx_left_top = (0,) * len(shape)
+                    idx_left_top = NDSlice((0,) * len(shape))
                     await dkey_node.read(slice=idx_left_top)
-                    idx_right_bottom = (-1,) * len(shape)
+                    idx_right_bottom = NDSlice((-1,) * len(shape))
                     await dkey_node.read(slice=idx_right_bottom)
                 except Exception as e:
                     msg = f"Error while reading '{stream_name}/{dkey_name}': {e}"
