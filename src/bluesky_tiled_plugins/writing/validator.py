@@ -284,15 +284,15 @@ def validate_data_source(
     true_chunks = orig_chunks = true_structure.chunks
 
     # Check if this might be StructDtype -- this would affect the shape validation
-    npdt_s = structure.data_type.to_numpy_dtype()
-    npdt_t = true_data_type.to_numpy_dtype()
-    if npdt_s != npdt_t:
+    if structure.data_type != true_data_type:
         if not fix_errors:
             raise StructureValidationException(
                 f"Data type mismatch: {structure.data_type} != {true_data_type}"
             )
 
         elif isinstance(structure.data_type, StructDtype):
+            npdt_s = structure.data_type.to_numpy_dtype()
+            npdt_t = true_data_type.to_numpy_dtype()
             if isinstance(true_data_type, StructDtype):
                 # Both are structural dtypes: use names from structure, dtypes from file
                 if len(npdt_s.names) != len(npdt_t.names):
@@ -318,12 +318,14 @@ def validate_data_source(
         elif isinstance(true_data_type, StructDtype):
             # Expected a simple builtin dtype, but the file was parsed as structured;
             # try to cast as BuiltinDtype if possible (common dtype that matches all fields)
+            npdt_t = true_data_type.to_numpy_dtype()
             common_dtype = numpy.result_type(*[f[0] for f in npdt_t.fields.values()])
             true_data_type = BuiltinDtype.from_numpy_dtype(common_dtype)
 
         # Both structure and file have simple built-in dtypes: just use the file dtype
+        msg = f"Fixed dtype mismatch: {structure.data_type.to_numpy_dtype()} -> {true_data_type.to_numpy_dtype()}"  # noqa
         structure.data_type = true_data_type
-        notes.append(f"Fixed dtype mismatch: {npdt_s} -> {npdt_t}")
+        notes.append(msg)
 
     # If this resource has the `frame_per_point`/`multiplier` parameter, the true shape of
     # the data is expected to be (num_events, multiplier, *rest) and needs to be adjusted,
@@ -345,8 +347,9 @@ def validate_data_source(
                 f"Shape mismatch: {structure.shape} != {true_shape}"
             )
 
+        msg = f"Fixed shape mismatch: {structure.shape} -> {true_shape}"
         structure.shape = true_shape
-        notes.append(f"Fixed shape mismatch: {structure.shape} -> {true_shape}")
+        notes.append(msg)
 
     if structure.chunks != true_chunks:
         if not fix_errors:
