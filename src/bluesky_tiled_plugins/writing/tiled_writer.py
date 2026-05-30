@@ -885,7 +885,7 @@ class _RunWriter(DocumentRouter):
                     # it will return 404 Not Found error; in this case, attempt to validate
                     # the data structure locally with the Consolidator.
 
-                    if response.status_code == httpx.codes.NOT_FOUND:
+                    if response.status_code in (httpx.codes.NOT_FOUND, httpx.codes.UNAUTHORIZED):
                         warnings.warn(
                             "Tiled server does not support remote validation. "
                             "Attempting to validate the data structure locally."
