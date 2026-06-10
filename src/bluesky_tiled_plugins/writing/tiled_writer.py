@@ -47,7 +47,7 @@ from packaging.version import Version
 
 from ..utils import truncate_json_overflow
 from ._dispatcher import Dispatcher
-from ._json_writer import JSONLinesWriter
+from ._json_writer import JSONLinesWriter, JSONDictWriter
 from .validator import ValidationException
 from .consolidators import (
     ConsolidatorBase,
@@ -56,6 +56,7 @@ from .consolidators import (
     StructureFamily,
     consolidator_factory,
 )
+from ..clients.catalog_of_bluesky_runs import CatalogOfBlueskyRuns
 
 # Aggregate the Event table rows and StreamDatums in batches before writing to Tiled
 BATCH_SIZE = 10000
@@ -159,12 +160,16 @@ ExternalEventDataReference = namedtuple(
 
 
 class _ConditionalBackup:
-    """Callback that tries to call the primary callback and, if it fails, flushes the buffer to backup callbacks.
+    """Callback to save Bluesky data if the primary callback fails.
 
-    Once an error has been encountererd in the primary callback, all subsequent documents would be sent to the
-    backup callbacks as well.
+    Callback that tries to call the primary callback and,
+    if it fails, flushes the buffer to backup callbacks.
 
-    This callback is intended to be used with a `RunRouter` and process documents from a single Bluesky run.
+    Once an error has been encountererd in the primary callback,
+    all subsequent documents would be sent to the backup callbacks as well.
+
+    This callback is intended to be used with a `RunRouter` and process
+    documents from a single Bluesky run.
     """
 
     def __init__(
@@ -212,8 +217,9 @@ class RunNormalizer(DocumentRouter):
     ):
         """Callback for updating Bluesky documents to their latest schema.
 
-        This callback can be used to subscribe additional consumers that require the updated documents.
-        Returns a shallow copy of the document to avoid modifying the original one.
+        This callback can be used to subscribe additional consumers that require
+        the updated documents. Returns a shallow copy of the document to avoid modifying
+        the original one.
 
         Parameters
         ----------
@@ -223,8 +229,8 @@ class RunNormalizer(DocumentRouter):
             The keys are document names (e.g., "start", "stop", "descriptor", etc.), and the values
             are functions that take a document as input and return a modified document.
         spec_to_mimetype : dict[str, str], optional
-            A dictionary mapping spec names to MIME types. This is used to convert `Resource` documents
-            to the latest `StreamResource` schema.
+            A dictionary mapping spec names to MIME types. This is used to convert `Resource`
+            documents to the latest `StreamResource` schema.
             The supplied dictionary updates the default `MIMETYPE_LOOKUP` dictionary.
         """
 
@@ -1095,6 +1101,7 @@ class TiledWriter:
         patches: dict[str, Callable] | None = None,
         spec_to_mimetype: dict[str, str] | None = None,
         backup_directory: str | None = None,
+        backup_dictionary: dict | None = None,
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
         validate: bool = False,
@@ -1147,6 +1154,7 @@ class TiledWriter:
         self.patches = patches or {}
         self.spec_to_mimetype = spec_to_mimetype or {}
         self.backup_directory = backup_directory
+        self.backup_dictionary = backup_dictionary
         self._normalizer = normalizer
         self._run_router = RunRouter([self._factory])
         self._batch_size = batch_size
@@ -1155,7 +1163,14 @@ class TiledWriter:
         self.ignore_errors = ignore_errors or []
 
     def _factory(self, name, doc):
-        """Factory method to create a callback for writing a single run into Tiled."""
+        """Factory method to create a callback for writing a single run into Tiled.
+
+        If `normalizer` is specified, create a RunNormalizer callback to update documents
+        to the latest schema before writing them to Tiled.
+
+        If `backup_directory` or `backup_dictionary` is specified, create a JSONLinesWriter
+        or JSONDictWriter callbacks to back up the documents.
+        """
         cb = run_writer = _RunWriter(
             self.client,
             batch_size=self._batch_size,
@@ -1171,9 +1186,13 @@ class TiledWriter:
             )
             cb.subscribe(run_writer)
 
+        backup_callbacks = []
         if self.backup_directory:
-            # If backup_directory is specified, create a conditional backup callback writing documents to JSONLines
-            cb = _ConditionalBackup(cb, [JSONLinesWriter(self.backup_directory)])
+            backup_callbacks.append(JSONLinesWriter(self.backup_directory))
+        if self.backup_dictionary is not None:
+            backup_callbacks.append(JSONDictWriter(self.backup_dictionary))
+        if backup_callbacks:
+            cb = _ConditionalBackup(cb, backup_callbacks)
 
         return [cb], []
 
@@ -1220,6 +1239,60 @@ class TiledWriter:
             backup_directory=backup_directory,
             batch_size=batch_size,
         )
+
+    def __call__(self, name, doc):
+        self._run_router(name, doc)
+
+
+class _RunInserter:
+    def __init__(self, client: CatalogOfBlueskyRuns):
+        self._client = client
+
+    def __call__(self, name, doc):
+        self._client.post_document(name, doc)
+
+
+class TiledInserter:
+    """Callback for _inserting_ plain documents into Tiled
+
+    This mimics the behavior of Databroker's `insert` method, which allows to insert
+    documents into MongoDB collections without normalization or validation.
+    """
+
+    def __init__(
+        self,
+        client: CatalogOfBlueskyRuns,
+        name: str,
+        *,
+        backup_directory: str | None = None,
+        backup_dictionary: dict | None = None,
+    ):
+        self.name = name  # needed to mimic the databroker.Broker api
+        self.client = client
+        self.backup_directory = backup_directory
+        self.backup_dictionary = backup_dictionary
+        self._run_router = RunRouter([self._factory])
+
+    def _factory(self, name, doc):
+        """Factory method to create a callback for processing a single Bluesky run
+
+        If backup_directory or backup_dictionary are specified, create conditional
+        backup callback(s) for saving documents as JSON.
+        """
+        cb = _RunInserter(self.client)
+
+        backup_callbacks = []
+        if self.backup_directory:
+            backup_callbacks.append(JSONLinesWriter(self.backup_directory))
+        if self.backup_dictionary is not None:
+            backup_callbacks.append(JSONDictWriter(self.backup_dictionary))
+        if backup_callbacks:
+            cb = _ConditionalBackup(cb, backup_callbacks)
+
+        return [cb], []
+
+    def insert(self, name, doc):
+        self(name, doc)
 
     def __call__(self, name, doc):
         self._run_router(name, doc)
