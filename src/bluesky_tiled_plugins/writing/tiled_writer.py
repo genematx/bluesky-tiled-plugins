@@ -1283,13 +1283,13 @@ class TiledInserter:
 
     def __init__(
         self,
-        name: str,
         client: CatalogOfBlueskyRuns,
+        name: str,
         *,
         backup_directory: str | None = None,
         backup_dictionary: dict | None = None,
     ):
-        self.name = name
+        self.name = name  # needed to mimic the databroker.Broker api
         self.client = client
         self.backup_directory = backup_directory
         self.backup_dictionary = backup_dictionary
