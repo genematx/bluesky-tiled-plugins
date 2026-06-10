@@ -33,6 +33,7 @@ class JSONWriter:
         filename: str | None = None,
     ):
         self.dirname = Path(dirname)
+        self.dirname.mkdir(parents=True, exist_ok=True)
         self.filename = filename
 
     def __call__(self, name, doc):
@@ -63,6 +64,7 @@ class JSONLinesWriter:
 
     def __init__(self, dirname: str, filename: str | None = None):
         self.dirname = Path(dirname)
+        self.dirname.mkdir(parents=True, exist_ok=True)
         self.filename = filename
 
     def __call__(self, name, doc):
