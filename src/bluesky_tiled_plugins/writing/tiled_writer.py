@@ -1123,6 +1123,7 @@ class TiledWriter:
         patches: dict[str, Callable] | None = None,
         spec_to_mimetype: dict[str, str] | None = None,
         backup_directory: str | None = None,
+        backup_dictionary: dict | None = None,
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
         validate: bool = False,
@@ -1175,6 +1176,7 @@ class TiledWriter:
         self.patches = patches or {}
         self.spec_to_mimetype = spec_to_mimetype or {}
         self.backup_directory = backup_directory
+        self.backup_dictionary = backup_dictionary
         self._normalizer = normalizer
         self._run_router = RunRouter([self._factory])
         self._batch_size = batch_size
