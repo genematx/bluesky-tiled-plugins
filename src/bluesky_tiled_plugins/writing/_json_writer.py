@@ -70,8 +70,7 @@ class JSONLinesWriter:
     def __call__(self, name, doc):
         self.filename = self.filename or default_name(name, doc, suffix=".jsonl")
 
-        mode = "a" if (self.dirname / self.filename).exists() else "w"
-        with open(self.dirname / self.filename, mode) as file:
+        with open(self.dirname / self.filename, "a") as file:
             json.dump({"name": name, "doc": doc}, file)
             file.write("\n")
 
