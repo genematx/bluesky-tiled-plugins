@@ -2,8 +2,6 @@ import collections
 import dataclasses
 import importlib
 import math
-import os
-import re
 import warnings
 from typing import Literal, cast
 from pathlib import Path
@@ -14,7 +12,7 @@ from tiled.mimetypes import DEFAULT_ADAPTERS_BY_MIMETYPE
 from tiled.structures.array import ArrayStructure, BuiltinDtype, StructDtype
 from tiled.structures.core import StructureFamily
 from tiled.structures.data_source import Asset, DataSource, Management
-from tiled.utils import OneShotCachedMap, path_from_uri, ensure_uri
+from tiled.utils import OneShotCachedMap, path_from_uri
 from ..utils import compile_template, list_summands
 
 # User-provided adapters take precedence over defaults.
@@ -26,9 +24,9 @@ CUSTOM_ADAPTERS_BY_MIMETYPE = OneShotCachedMap[str, type](
         "application/x-hdf5;type=xia-xmap": lambda: importlib.import_module(
             "mng2sql.adapters.xiaxmap", __name__
         ).XIAxMAPAdapter,
-        "application/x-hdf5;type=eiger-mx": lambda: importlib.import_module(
+        "application/x-hdf5;type=eiger": lambda: importlib.import_module(
             "mng2sql.adapters.eigermx", __name__
-        ).EigerMXAdapter,
+        ).EigerHDF5Adapter,
     }
 )
 DEFAULT_ADAPTERS_BY_MIMETYPE = collections.ChainMap(
@@ -120,6 +118,7 @@ class ConsolidatorBase:
     """
 
     supported_mimetypes: set[str] = {"application/octet-stream"}
+    asset_role: str = "data_uris"  # Default parameter (role) for the asset(s)
     join_method: Literal["stack", "concat"] = "concat"
     join_chunks: bool = True
 
@@ -132,7 +131,7 @@ class ConsolidatorBase:
             self.assets: list[Asset] = [Asset(data_uri=self.uri, is_directory=False, parameter="data_uri")]
         else:
             self.assets: list[Asset] = [
-                Asset(data_uri=self.uri, is_directory=False, parameter="data_uris", num=0)
+                Asset(data_uri=self.uri, is_directory=False, parameter=self.asset_role, num=0)
             ]
         self._sres_parameters = stream_resource["parameters"]
         self._indx_offset = 0  # To reset file index for each new StreamResource
@@ -652,7 +651,7 @@ class CSVConsolidator(ConsolidatorBase):
 
 
 class HDF5Consolidator(ConsolidatorBase):
-    supported_mimetypes = {"application/x-hdf5", "application/x-hdf5;type=xia-xmap", "application/x-hdf5;type=eiger-mx"}
+    supported_mimetypes = {"application/x-hdf5"}
 
     def __new__(cls, stream_resource: StreamResource, descriptor: EventDescriptor):
         if stream_resource["parameters"].get("template"):
@@ -696,50 +695,10 @@ class HDF5Consolidator(ConsolidatorBase):
         asset = Asset(
             data_uri=stream_resource["uri"],
             is_directory=False,
-            parameter="data_uris",
+            parameter=self.asset_role,
             num=len(self.assets),
         )
         self.assets.append(asset)
-
-    def validate(self, fix_errors=False) -> list[str]:
-        if (self._sres_parameters.get("_resource_spec") == 'AD_EIGER_MX') \
-            and (self._sres_parameters.get("data_key") == "data"):
-            # Special handling for NexusMX HDF5 files where data is stored in several linked files
-            if len(self.assets) != 1:
-                raise ValueError("NexusMX HDF5 dataset must be referenced by a single master file.")
-            master_uri = self.assets[0].data_uri
-            master_fpath = path_from_uri(master_uri)
-            self.assets.clear()
-
-            # Repopulate assets based on the linked files
-            import h5py
-
-            with h5py.File(master_fpath, 'r') as f:
-                for i, key in enumerate(f['/entry/data'].keys()):
-                    link = f['/entry/data'].get(key, getlink=True)
-                    self.assets.append(
-                        Asset(
-                            data_uri=ensure_uri(master_fpath.with_name(link.filename)),
-                            is_directory=False,
-                            parameter="data_uris",
-                            num=i,
-                        )
-                    )
-                    self._sres_parameters['dataset'] = link.path  # assume all links point to the same dataset path
-        
-            # Proceed with usual validation
-            notes = super().validate(fix_errors=fix_errors)
-
-            # Keep the master file as a separate asset
-            self.assets.append(Asset(data_uri=master_uri, is_directory=False, parameter="master"))
-
-            msg = "Added linked files to the set of assets."
-            warnings.warn(msg, stacklevel=2)
-            notes.append(msg)
-        else:
-            notes = super().validate(fix_errors=fix_errors)
-
-        return notes
 
 
 class MultipartRelatedConsolidator(ConsolidatorBase):
@@ -751,14 +710,17 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         super().__init__(stream_resource, descriptor)
         self.assets.clear()  # Assets will be populated based on datum indices
         self.data_uris: list[str] = []
-        self.chunk_shape = self.chunk_shape or (
-            1,
-        )  # I.e. number of frames per file (tiff, jpeg, etc.)
-        if self.join_method == "concat":
-            assert self.datum_shape[0] % self.chunk_shape[0] == 0, (
-                f"Number of frames per file ({self.chunk_shape[0]}) must divide the total number of frames per "
-                f"datum ({self.datum_shape[0]}): variable-sized files are not allowed."
-            )
+        self.chunk_shape = self.chunk_shape or (1,)  # num frames per file
+
+        # Ensure that the number of frames per file divides teh number of frames per datum.
+        if (self.join_method == "concat") and (self.datum_shape[0] % self.chunk_shape[0] != 0):
+            self.chunk_shape = (self.datum_shape[0],)
+
+        self.files_per_datum = self._sres_parameters.get("files_per_datum") or (
+            self.datum_shape[0] // self.chunk_shape[0]
+            if self.join_method == "concat"
+            else self.metadata.get("frame_per_point", 1)
+        )
 
         # Compile and set the filename template
         self.template = compile_template(
@@ -793,19 +755,14 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         of the resulting dataset, and hence corresponds to a single file.
         """
 
-        files_per_datum = (
-            self.datum_shape[0] // self.chunk_shape[0]
-            if self.join_method == "concat"
-            else self.metadata.get("frame_per_point", 1)
-        )
-        first_file_indx = doc["indices"]["start"] * files_per_datum
-        last_file_indx = doc["indices"]["stop"] * files_per_datum
+        first_file_indx = doc["indices"]["start"] * self.files_per_datum
+        last_file_indx = doc["indices"]["stop"] * self.files_per_datum
         for indx in range(first_file_indx, last_file_indx):
             new_datum_uri = self.get_datum_uri(indx)
             new_asset = Asset(
                 data_uri=new_datum_uri,
                 is_directory=False,
-                parameter="data_uris",
+                parameter=self.asset_role,
                 num=len(self.assets),
             )
             self.assets.append(new_asset)
