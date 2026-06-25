@@ -93,10 +93,14 @@ def test_insert_method_alias(RE, mongo_catalog_client):
 @pytest.mark.parametrize(
     "fname, skip_keys",
     [
-        # `internal_events`: the `empty` data key is declared with shape
-        # `[]` but rows have actual shape `(0,)`, which MongoAdapter
-        # can't reshape back to a scalar.
-        ("internal_events", {"empty"}),
+        # `internal_events`:
+        #   `empty`: declared with shape `[]` but rows have actual shape
+        #     `(0,)`, which MongoAdapter can't reshape back to a scalar.
+        #   `ragged`: declared with shape `[2, None]`; `databroker.mongo_normalized`
+        #     has no ragged-array support and dask `normalize_chunks` rejects
+        #     `None` dims. `TiledInserter` writes it correctly; only the
+        #     legacy Mongo read path can't serve it.
+        ("internal_events", {"empty", "ragged"}),
         # `external_assets_legacy`: external data keys reference the
         # `AD_HDF5_SWMR_STREAM` resource spec, for which MongoAdapter's
         # Filler has no handler registered in this test environment.
