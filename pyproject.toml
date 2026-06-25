@@ -57,11 +57,18 @@ BlueskyEventStream = "bluesky_tiled_plugins.clients.bluesky_event_stream:Bluesky
 [dependency-groups]
 test = [
   "bluesky",
+  "databroker",
+  "fakeredis",
   "h5py",
   "jinja2",
+  "mongomock",
   "ophyd",
+  "pymongo",
   "pytest >=6",
   "pytest-cov >=3",
+  "redis",
+  "redis-json-dict",
+  "suitcase-mongo",
   "tifffile",
   "tiled[server] >=0.2.9",
 ]
