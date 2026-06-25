@@ -1,5 +1,6 @@
 import copy
 import functools
+import httpx
 import io
 import json
 import keyword
@@ -8,6 +9,8 @@ from datetime import datetime
 
 from tiled.client.container import Container
 from tiled.client.utils import handle_error, retry_context
+from tiled.utils import safe_json_dump
+from tiled.type_aliases import JSON_ITEM
 
 from ._common import IPYTHON_METHODS
 from .bluesky_event_stream import BlueskyEventStreamV2SQL
@@ -22,6 +25,7 @@ from .document import (
     StreamDatum,
     StreamResource,
 )
+from ..writing.validator import validate, ValidationException
 
 _document_types = {
     "start": Start,
@@ -50,14 +54,14 @@ class BlueskyRun(Container):
         return _cls(context, item=item, structure_clients=structure_clients, **kwargs)
 
     @staticmethod
-    def _is_sql(item):
+    def _is_sql(item) -> bool:
         for spec in item["attributes"]["specs"]:
             if spec["name"] == "BlueskyRun":
                 if spec["version"].startswith("3."):
                     return True
                 return False
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         metadata = self.metadata
         datetime_ = datetime.fromtimestamp(metadata["start"]["time"])
         return (
@@ -70,7 +74,7 @@ class BlueskyRun(Container):
         )
 
     @property
-    def start(self):
+    def start(self) -> dict[str, JSON_ITEM]:
         """
         The Run Start document. A convenience alias:
 
@@ -80,7 +84,7 @@ class BlueskyRun(Container):
         return self.metadata["start"]
 
     @property
-    def stop(self):
+    def stop(self) -> dict[str, JSON_ITEM]:
         """
         The Run Stop document. A convenience alias:
 
@@ -90,7 +94,7 @@ class BlueskyRun(Container):
         return self.metadata["stop"]
 
     @functools.cached_property
-    def descriptors(self):
+    def descriptors(self) -> list[dict[str, JSON_ITEM]]:
         return [doc for name, doc in self.documents() if name == "descriptor"]
 
     def __getattr__(self, key):
@@ -117,7 +121,7 @@ class BlueskyRun(Container):
         ]
         return super().__dir__() + tab_completable_entries
 
-    def describe(self):
+    def describe(self) -> dict[str, dict[str, JSON_ITEM]]:
         "For back-compat with intake-based BlueskyRun"
         warnings.warn(
             "This will be removed. Use .metadata directly instead of describe()['metadata'].",
@@ -142,7 +146,7 @@ class BlueskyRun(Container):
         )
 
     @property
-    def base(self):
+    def base(self) -> Container:
         "Return the base Container client instead of a BlueskyRun client"
         return Container(
             self.context,
@@ -184,11 +188,11 @@ class BlueskyRunV2(BlueskyRun):
         return header
 
     @property
-    def v2(self):
+    def v2(self) -> "BlueskyRunV2":
         return self
 
     @property
-    def v3(self):
+    def v3(self) -> "BlueskyRunV3":
         if not self._is_sql(self.item):
             raise NotImplementedError(
                 "v3 is not available for MongoDB-based BlueskyRun"
@@ -363,6 +367,11 @@ class _BlueskyRunSQL(BlueskyRun):
         yield from self._stream_names
 
     def documents(self, fill=False):
+        if fill:
+            raise NotImplementedError(
+                "documents(fill=True) is not supported for SQL-based BlueskyRun clients"
+            )
+
         with io.BytesIO() as buffer:
             self.export(buffer, format="application/json-seq")
             buffer.seek(0)
@@ -434,7 +443,7 @@ class BlueskyRunV3(_BlueskyRunSQL):
         return self.v2.v1
 
     @property
-    def v2(self):
+    def v2(self) -> BlueskyRunV2:
         structure_clients = copy.copy(self.structure_clients)
         structure_clients.set("BlueskyRun", lambda: BlueskyRunV2)
         return BlueskyRunV2(
@@ -442,5 +451,96 @@ class BlueskyRunV3(_BlueskyRunSQL):
         )
 
     @property
-    def v3(self):
+    def v3(self) -> "BlueskyRunV3":
         return self
+
+    def validate(
+        self,
+        fix_errors=True,
+        try_reading=True,
+        raise_on_error=False,
+        ignore_errors=None,
+        write_notes=True,
+    ):
+        """Validate for for completeness and data integrity.
+
+        Parameters
+        ----------
+        fix_errors : bool, optional
+            Whether to attempt to fix structural errors found during validation.
+            Default is True.
+        try_reading : bool, optional
+            Whether to attempt reading the data for external data keys.
+            Default is True.
+        raise_on_error : bool, optional
+            Whether to raise an exception on the first validation error encountered.
+            Default is False.
+        ignore_errors : list of str, optional
+            List of error messages to ignore during validation. If any errors whose
+            message matches one of the patterns in this list are encountered, they will
+            be logged, but the validation of the remaining data keys will continue.
+        write_notes : bool, optional
+            Whether to write validation notes to the root client's metadata.
+            Default is True.
+
+        Returns
+        -------
+        bool
+            True if the data structure is valid and reading succeeded, False otherwise.
+        """
+
+        is_valid = False
+
+        for attempt in retry_context():
+            with attempt:
+                response = self.context.http_client.post(
+                    self.uri.replace("/api/v1/metadata/", "/custom/validate/", 1),
+                    params={"fix": fix_errors, "read": try_reading},
+                    content=safe_json_dump({"ignore_errors": ignore_errors}),
+                )
+
+        try:
+            content = handle_error(response).json()
+            is_valid, notes = content.get("valid"), content.get("notes", [])
+
+            if is_valid:
+                for note in notes:
+                    warnings.warn(note, stacklevel=2)
+
+                if notes and write_notes:
+                    existing_notes = self.metadata.get("notes", [])
+                    self.update_metadata(
+                        {"notes": existing_notes + notes}, drop_revision=True
+                    )
+            elif raise_on_error:
+                msg = "Remote validation failed: " + "; ".join(notes)
+                raise ValidationException(msg, self.item["id"])
+
+        except httpx.HTTPStatusError as e:
+            # Backcompatibility: if the server does not support validation endpoint,
+            # it will return 404 Not Found error; in this case, attempt to validate
+            # the data structure locally by the client itself (requires multiple
+            # round-trips to the server, but better than nothing).
+
+            if response.status_code == httpx.codes.NOT_FOUND:
+                warnings.warn(
+                    "Tiled server does not support remote validation. "
+                    "Attempting to validate the data structure by the client.",
+                    stacklevel=2,
+                )
+                return validate(
+                    self,
+                    fix_errors=fix_errors,
+                    try_reading=try_reading,
+                    raise_on_error=raise_on_error,
+                    ignore_errors=ignore_errors,
+                    write_notes=write_notes,
+                )
+            elif raise_on_error:
+                msg = (
+                    "Remote validation request failed with status code "
+                    f"{response.status_code}: {response.text}"
+                )
+                raise ValidationException(msg, self.item["id"]) from e
+
+        return is_valid

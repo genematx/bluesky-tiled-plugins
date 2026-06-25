@@ -5,7 +5,8 @@ from collections import defaultdict, deque, namedtuple
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+import re
+from typing import Any, Optional, cast
 import warnings
 
 import httpx
@@ -46,7 +47,8 @@ from packaging.version import Version
 
 from ..utils import truncate_json_overflow
 from ._dispatcher import Dispatcher
-from ._json_writer import JSONLinesWriter
+from ._json_writer import JSONLinesWriter, JSONDictWriter
+from .validator import ValidationException
 from .consolidators import (
     ConsolidatorBase,
     DataSource,
@@ -54,6 +56,7 @@ from .consolidators import (
     StructureFamily,
     consolidator_factory,
 )
+from ..clients.catalog_of_bluesky_runs import CatalogOfBlueskyRuns
 
 # Aggregate the Event table rows and StreamDatums in batches before writing to Tiled
 BATCH_SIZE = 10000
@@ -110,12 +113,6 @@ MIMETYPE_LOOKUP = defaultdict(
 logger = logging.getLogger(__name__)
 
 
-class ValidationError(Exception):
-    """Custom exception for validation errors in Tiled RunWriter."""
-
-    pass
-
-
 def concatenate_stream_datums(*docs: StreamDatum):
     """Concatenate consecutive StreamDatum documents into a single StreamDatum document"""
 
@@ -163,12 +160,16 @@ ExternalEventDataReference = namedtuple(
 
 
 class _ConditionalBackup:
-    """Callback that tries to call the primary callback and, if it fails, flushes the buffer to backup callbacks.
+    """Callback to save Bluesky data if the primary callback fails.
 
-    Once an error has been encountererd in the primary callback, all subsequent documents would be sent to the
-    backup callbacks as well.
+    Callback that tries to call the primary callback and,
+    if it fails, flushes the buffer to backup callbacks.
 
-    This callback is intended to be used with a `RunRouter` and process documents from a single Bluesky run.
+    Once an error has been encountererd in the primary callback,
+    all subsequent documents would be sent to the backup callbacks as well.
+
+    This callback is intended to be used with a `RunRouter` and process
+    documents from a single Bluesky run.
     """
 
     def __init__(
@@ -216,8 +217,9 @@ class RunNormalizer(DocumentRouter):
     ):
         """Callback for updating Bluesky documents to their latest schema.
 
-        This callback can be used to subscribe additional consumers that require the updated documents.
-        Returns a shallow copy of the document to avoid modifying the original one.
+        This callback can be used to subscribe additional consumers that require
+        the updated documents. Returns a shallow copy of the document to avoid modifying
+        the original one.
 
         Parameters
         ----------
@@ -227,8 +229,8 @@ class RunNormalizer(DocumentRouter):
             The keys are document names (e.g., "start", "stop", "descriptor", etc.), and the values
             are functions that take a document as input and return a modified document.
         spec_to_mimetype : dict[str, str], optional
-            A dictionary mapping spec names to MIME types. This is used to convert `Resource` documents
-            to the latest `StreamResource` schema.
+            A dictionary mapping spec names to MIME types. This is used to convert `Resource`
+            documents to the latest `StreamResource` schema.
             The supplied dictionary updates the default `MIMETYPE_LOOKUP` dictionary.
         """
 
@@ -402,13 +404,13 @@ class RunNormalizer(DocumentRouter):
         return sres_doc, sdat_doc
 
     def start(self, doc: RunStart):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         if patch := self.patches.get("start"):
             doc = patch(doc)
         self.emit(DocumentNames.start, doc)
 
     def stop(self, doc: RunStop):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         if patch := self.patches.get("stop"):
             doc = patch(doc)
 
@@ -563,7 +565,7 @@ class RunNormalizer(DocumentRouter):
                 self._ext_ref_cache.append(missing)
 
     def resource(self, doc: Resource):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         if patch := self.patches.get("resource"):
             doc = patch(doc)
 
@@ -575,7 +577,7 @@ class RunNormalizer(DocumentRouter):
         self._sres_cache[doc["uid"]] = self._convert_resource_to_stream_resource(doc)
 
     def stream_resource(self, doc: StreamResource):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         if patch := self.patches.get("stream_resource"):
             doc = patch(doc)
 
@@ -584,13 +586,13 @@ class RunNormalizer(DocumentRouter):
         self.emit(DocumentNames.stream_resource, doc)
 
     def stream_datum(self, doc: StreamDatum):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         if patch := self.patches.get("stream_datum"):
             doc = patch(doc)
         self.emit(DocumentNames.stream_datum, doc)
 
     def datum(self, doc: Datum):
-        doc = copy.copy(doc)
+        doc = copy.deepcopy(doc)
         # Mark the Datum document with the spec of the corresponding Resource, if known
         if spec := self._specs_by_resource_uid.get(doc["resource"]):
             doc["datum_kwargs"] = doc.get("datum_kwargs", {}) | {"_resource_spec": spec}
@@ -634,6 +636,7 @@ class _RunWriter(DocumentRouter):
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
         validate: bool = False,
+        ignore_errors: Optional[list[str]] = None,
     ):
         """Write documents from a single Bluesky Run into Tiled.
 
@@ -666,17 +669,16 @@ class _RunWriter(DocumentRouter):
         self._stream_resource_cache: dict[str, StreamResource] = {}
         self._consolidators: dict[str, ConsolidatorBase] = {}
         self._internal_data_cache: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        self._external_data_cache: dict[
-            str, StreamDatum
-        ] = {}  # sres_uid : (concatenated) StreamDatum
-        self._int_array_keys: dict[str, set[str]] = defaultdict(
-            set
-        )  # data_keys with array data by desc_name
+        # sres_uid : (concatenated) StreamDatum
+        self._external_data_cache: dict[str, StreamDatum] = {}
+        # data_keys corresponding to internal dxata written as arrays, by desc_name
+        self._int_array_keys: dict[str, set[str]] = defaultdict(set)
+        # data_keys with array data of inconsistent length, by desc_name
+        self._int_ragged_array_keys: dict[str, set[str]] = defaultdict(set)
         self._batch_size: int = batch_size
-        self._max_array_size: int = (
-            max_array_size  # Max size of arrays to write to tabular storage
-        )
+        self._max_array_size: int = max_array_size  # Max array size in SQL
         self._validate: bool = validate
+        self.ignore_errors = ignore_errors or []
         self.data_keys: dict[str, DataKey] = {}
         self.access_tags: list[str] | None = None
         self.notes: list[str] = []
@@ -726,7 +728,32 @@ class _RunWriter(DocumentRouter):
                     extend=True,
                 )
 
-        # 2. Write internal tabular data; all data_keys for arrays have been removed from data_cache on step 1
+        # 2. Write internal ragged array data, if any; remove it from the tabular data
+        for key in self._int_ragged_array_keys[desc_name]:
+            from tiled.structures.ragged import make_ragged_array
+
+            arr_lst = [row.pop(key) for row in data_cache if key in row]
+            shape = (len(arr_lst), *self.data_keys[key].get("shape", ()))
+            array = make_ragged_array(arr_lst, shape=shape)
+
+            # Create a new ragged array data node or update the existing one
+            if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):
+                metadata = truncate_json_overflow(self.data_keys.get(key, {}))
+                arr_client = desc_node.write_ragged(
+                    array,
+                    key=key,
+                    metadata=metadata,
+                    dims=("time", *[f"dim_{i}" for i in range(1, len(shape))]),
+                    access_tags=self.access_tags,
+                )
+                self._internal_arrays[f"{desc_name}/{key}"] = arr_client
+                self.notes.append(
+                    f"Internal data for '{key}' in stream '{desc_name}' written as ragged array."
+                )
+            else:
+                arr_client.patch(array, offset=arr_client.shape[0], extend=True)
+
+        # 3. Write internal tabular data; all data_keys for arrays have been removed from data_cache on step 1
         if not (table := pyarrow.Table.from_pylist(data_cache)):
             return  # Nothing to write
 
@@ -853,103 +880,87 @@ class _RunWriter(DocumentRouter):
 
         # Validate the Structure of the data for each external resource, if requested
         # Try validating directly on the server, first; if endpoint is not available, do it locally
-        if self._validate:
-            for attempt in retry_context():
-                with attempt:
-                    response = self.root_node.context.http_client.get(
-                        self.root_node.uri.replace("/metadata/", "/validate/", 1),
-                        params={"fix": True},
-                    )
-
-            try:
-                content = handle_error(response).json()
-                _notes = content.get("notes", [])
-                if content.get("valid"):
-                    logger.info("Remote validation successful for all external data.")
-                    self.notes.extend(_notes)
-                    for note in _notes:
-                        warnings.warn(note, stacklevel=2)
-                else:
-                    msg = "Remote validation failed: " + "; ".join(_notes)
-                    raise ValidationError(msg)
-
-            except httpx.HTTPStatusError as e:
-                # Backcompatibility: if the server does not support validation endpoint,
-                # it will return 404 Not Found error; in this case, attempt to validate
-                # the data structure locally with the Consolidator.
-
-                if response.status_code == httpx.codes.NOT_FOUND:
-                    warnings.warn(
-                        "Tiled server does not support remote validation. "
-                        "Attempting to validate the data structure locally."
-                    )
-                    for sres_node, consolidator in node_and_cons:
-                        title = f"Validation of '{sres_node.item['id']}'"
-                        try:
-                            _notes = consolidator.validate(fix_errors=True)
-                            self.notes.extend([title + ": " + note for note in _notes])
-                        except Exception as e:
-                            msg = (
-                                f"{type(e).__name__}: "
-                                + str(e).replace("\n", " ").replace("\r", "").strip()
-                            )
-                            msg = title + f" failed with error: {msg}"
-                            raise ValidationError(msg) from e
-
-                        try:
-                            _notes = consolidator.validate(fix_errors=True)
-                            self.notes.extend([title + ": " + note for note in _notes])
-                        except FileNotFoundError as e:
-                            if (e.filename is not None) and Path(e.filename).parent.exists():
-                                msg = title + f" failed with error: {e.filename} is not found, " \
-                                    + "but its parent directory exists and is readable."
-                                self.notes.append(msg)
-                                logger.error(msg + " Continuing validation.")
-                            elif e.filename is None:
-                                if 'No such file or directory' in str(e):
-                                    import re
-                                    if m := re.search(r":\s*'([^']+)'$", str(e)):
-                                        fpath = m.group(1)
-                                        if (not Path(fpath).exists()) and Path(fpath).parent.exists():
-                                            msg = title + f" failed with error: {fpath} is not found, " \
-                                                + "but its parent directory exists and is readable."
-                                            self.notes.append(msg)
-                                            logger.error(msg + " Continuing validation.")
-                                else:
-                                    msg = title + f" failed with error: {e}"
-                                    raise ValidationError(msg) from e
-                            else:
-                                msg = title + f" failed with error: neither {e.filename}, " \
-                                    + "nor its parent directory exist. Cannot continue validation."
-                                raise ValidationError(msg) from e
-                        except Exception as e:
-                            msg = (
-                                f"{type(e).__name__}: "
-                                + str(e).replace("\n", " ").replace("\r", "").strip()
-                            )
-                            msg = title + f" failed with error: {msg}"
-                            if "PCAP.TS_TRIG.Value" in str(e):
-                                logger.warning(msg + " Continuing validation.")
-                            elif ("out of bounds for axis 1 with size 1" in msg and "xs_channel" in msg) or \
-                                ("out of bounds for axis 1 with size " in msg and "xs_settings_" in msg):
-                                logger.warning(msg + " Continuing validation.")
-                            else:
-                                raise ValidationError(msg) from e
-                        self._update_data_source_for_node(
-                            sres_node, consolidator.get_data_source()
+        try:
+            if self._validate:
+                for attempt in retry_context():
+                    with attempt:
+                        response = self.root_node.context.http_client.post(
+                            self.root_node.uri.replace(
+                                "/api/v1/metadata/", "/custom/validate/", 1
+                            ),
+                            params={"fix": True},
+                            content=safe_json_dump(
+                                {"ignore_errors": self.ignore_errors}
+                            ),
                         )
 
-                else:
-                    msg = (
-                        "Remote validation request failed with status code "
-                        f"{response.status_code}: {response.text}"
-                    )
-                    raise ValidationError(msg) from e
+                try:
+                    content = handle_error(response).json()
+                    _notes = content.get("notes", [])
+                    if content.get("valid"):
+                        self.notes.extend(_notes)
+                        for note in _notes:
+                            warnings.warn("Remote validation: " + note, stacklevel=2)
+                        if not _notes:
+                            logger.info(
+                                "Remote validation successful for all external data."
+                            )
+                    else:
+                        msg = "Remote validation failed: " + "; ".join(_notes)
+                        raise ValidationException(msg, self.root_node.item["id"])
 
-        # Write the stop document to the metadata, include notes from the normalizer, if any
-        notes = doc.pop("_run_normalizer_notes", []) + self.notes
-        md_update = {"stop": doc, **({"notes": notes} if notes else {})}
-        self.root_node.update_metadata(metadata=md_update, drop_revision=True)
+                except httpx.HTTPStatusError as e:
+                    # Backcompatibility: if the server does not support validation endpoint,
+                    # it will return 404 Not Found error; in this case, attempt to validate
+                    # the data structure locally with the Consolidator.
+
+                    if response.status_code == httpx.codes.NOT_FOUND:
+                        warnings.warn(
+                            "Tiled server does not support remote validation. "
+                            "Attempting to validate the data structure locally."
+                        )
+                        for sres_node, consolidator in node_and_cons:
+                            title = f"Validation of '{sres_node.item['id']}'"
+                            try:
+                                _notes = consolidator.validate(fix_errors=True)
+                                self.notes.extend(
+                                    [title + ": " + note for note in _notes]
+                                )
+                            except Exception as e:
+                                msg = (
+                                    f"{type(e).__name__}: "
+                                    + str(e)
+                                    .replace("\n", " ")
+                                    .replace("\r", "")
+                                    .strip()
+                                )
+                                msg = title + f" failed with error: {msg}"
+                                if any(
+                                    re.search(ptrn, msg) for ptrn in self.ignore_errors
+                                ):
+                                    warnings.warn(msg)
+                                else:
+                                    raise ValidationException(
+                                        msg, sres_node.item["id"]
+                                    ) from e
+                            self._update_data_source_for_node(
+                                sres_node, consolidator.get_data_source()
+                            )
+                    else:
+                        msg = (
+                            "Remote validation request failed with status code "
+                            f"{response.status_code}: {response.text}"
+                        )
+                        raise ValidationException(msg, self.root_node.item["id"]) from e
+
+        except Exception:
+            raise
+
+        finally:
+            # Write the stop document to the metadata, include any notes from normalizer
+            notes = doc.pop("_run_normalizer_notes", []) + self.notes
+            md_update = {"stop": doc, **({"notes": notes} if notes else {})}
+            self.root_node.update_metadata(metadata=md_update, drop_revision=True)
 
     def descriptor(self, doc: EventDescriptor):
         desc_name = doc["name"]  # Name of the descriptor/stream
@@ -971,14 +982,13 @@ class _RunWriter(DocumentRouter):
                 access_tags=self.access_tags,
             ).base
 
-            # Keep track of data_keys for internal array data to be written as zarr, if any
+            # Keep track of data_keys for internal array data to be written as zarr or ragged, if any
             for key, val in doc.get("data_keys", {}).items():
-                if (
-                    ("external" not in val.keys())
-                    and (val.get("dtype") == "array")
-                    and (0 <= self._max_array_size < sum(val.get("shape", [])))
-                ):
-                    self._int_array_keys[desc_name].add(key)
+                if ("external" not in val.keys()) and (val.get("dtype") == "array"):
+                    if None in val.get("shape", ()):
+                        self._int_ragged_array_keys[desc_name].add(key)
+                    elif 0 <= self._max_array_size < sum(val.get("shape", ())):
+                        self._int_array_keys[desc_name].add(key)
         else:
             # Rare Case: This new descriptor likely updates stream configs mid-experiment
             # We assume tha the full descriptor has been already received, so we don't need to store everything
@@ -1113,11 +1123,13 @@ class TiledWriter:
         patches: dict[str, Callable] | None = None,
         spec_to_mimetype: dict[str, str] | None = None,
         backup_directory: str | None = None,
+        backup_dictionary: dict | None = None,
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
         validate: bool = False,
+        ignore_errors: Optional[list[str]] = None,
     ):
-        """Callback for write metadata and data from Bluesky documents into Tiled.
+        """Callback for writing metadata and data from Bluesky documents into Tiled.
 
         This callback relies on the `RunRouter` to route documents from one or more runs into
         independent instances of the `_RunWriter` callback. The `RunRouter` is responsible for
@@ -1157,26 +1169,36 @@ class TiledWriter:
             to Tiled immediately after they are received.
         validate : bool
             If True, validate all data sources before writing to Tiled. This requires the access to the
-            files on the client.
+            files on the client or remote validation endpoint to be enabled on the server.
         """
 
         self.client = client.include_data_sources()
         self.patches = patches or {}
         self.spec_to_mimetype = spec_to_mimetype or {}
         self.backup_directory = backup_directory
+        self.backup_dictionary = backup_dictionary
         self._normalizer = normalizer
         self._run_router = RunRouter([self._factory])
         self._batch_size = batch_size
         self._max_array_size = max_array_size
         self._validate = validate
+        self.ignore_errors = ignore_errors or []
 
     def _factory(self, name, doc):
-        """Factory method to create a callback for writing a single run into Tiled."""
+        """Factory method to create a callback for writing a single run into Tiled.
+
+        If `normalizer` is specified, create a RunNormalizer callback to update documents
+        to the latest schema before writing them to Tiled.
+
+        If `backup_directory` or `backup_dictionary` is specified, create a JSONLinesWriter
+        or JSONDictWriter callbacks to back up the documents.
+        """
         cb = run_writer = _RunWriter(
             self.client,
             batch_size=self._batch_size,
             max_array_size=self._max_array_size,
             validate=self._validate,
+            ignore_errors=self.ignore_errors,
         )
 
         if self._normalizer:
@@ -1186,9 +1208,13 @@ class TiledWriter:
             )
             cb.subscribe(run_writer)
 
+        backup_callbacks = []
         if self.backup_directory:
-            # If backup_directory is specified, create a conditional backup callback writing documents to JSONLines
-            cb = _ConditionalBackup(cb, [JSONLinesWriter(self.backup_directory)])
+            backup_callbacks.append(JSONLinesWriter(self.backup_directory))
+        if self.backup_dictionary is not None:
+            backup_callbacks.append(JSONDictWriter(self.backup_dictionary))
+        if backup_callbacks:
+            cb = _ConditionalBackup(cb, backup_callbacks)
 
         return [cb], []
 
@@ -1235,6 +1261,60 @@ class TiledWriter:
             backup_directory=backup_directory,
             batch_size=batch_size,
         )
+
+    def __call__(self, name, doc):
+        self._run_router(name, doc)
+
+
+class _RunInserter:
+    def __init__(self, client: CatalogOfBlueskyRuns):
+        self._client = client
+
+    def __call__(self, name, doc):
+        self._client.post_document(name, doc)
+
+
+class TiledInserter:
+    """Callback for _inserting_ plain documents into Tiled
+
+    This mimics the behavior of Databroker's `insert` method, which allows to insert
+    documents into MongoDB collections without normalization or validation.
+    """
+
+    def __init__(
+        self,
+        client: CatalogOfBlueskyRuns,
+        name: str,
+        *,
+        backup_directory: str | None = None,
+        backup_dictionary: dict | None = None,
+    ):
+        self.name = name  # needed to mimic the databroker.Broker api
+        self.client = client
+        self.backup_directory = backup_directory
+        self.backup_dictionary = backup_dictionary
+        self._run_router = RunRouter([self._factory])
+
+    def _factory(self, name, doc):
+        """Factory method to create a callback for processing a single Bluesky run
+
+        If backup_directory or backup_dictionary are specified, create conditional
+        backup callback(s) for saving documents as JSON.
+        """
+        cb = _RunInserter(self.client)
+
+        backup_callbacks = []
+        if self.backup_directory:
+            backup_callbacks.append(JSONLinesWriter(self.backup_directory))
+        if self.backup_dictionary is not None:
+            backup_callbacks.append(JSONDictWriter(self.backup_dictionary))
+        if backup_callbacks:
+            cb = _ConditionalBackup(cb, backup_callbacks)
+
+        return [cb], []
+
+    def insert(self, name, doc):
+        self(name, doc)
 
     def __call__(self, name, doc):
         self._run_router(name, doc)

@@ -4,6 +4,7 @@ import time
 import copy
 import collections
 from dataclasses import asdict
+import numpy
 from packaging.version import Version
 
 from tiled.client.array import ArrayClient
@@ -11,7 +12,7 @@ from tiled.client.dataframe import DataFrameClient
 from tiled.client.utils import handle_error, retry_context
 from tiled.mimetypes import DEFAULT_ADAPTERS_BY_MIMETYPE
 from tiled.utils import safe_json_dump
-from tiled.structures.array import StructDtype
+from tiled.structures.array import StructDtype, BuiltinDtype
 from tiled.structures.core import STRUCTURE_TYPES
 from tiled.structures.data_source import DataSource
 from ..utils import list_summands
@@ -46,7 +47,8 @@ def validate(
     fix_errors=True,
     try_reading=True,
     raise_on_error=False,
-    ignore_errors=[],
+    ignore_errors=None,
+    write_notes=True,
 ):
     """Validate the given BlueskyRun client for completeness and data integrity.
 
@@ -65,8 +67,12 @@ def validate(
         Whether to raise an exception on the first validation error encountered.
         Default is False.
     ignore_errors : list of str, optional
-        List of error messages to ignore during reading validation.
-        Default is an empty list.
+        List of error messages to ignore during validation. If any errors whose
+        message matches one of the patterns in this list are encountered, they will
+        be logged, but the validation of the remaining data keys will continue.
+    write_notes : bool, optional
+        Whether to write validation notes to the root client's metadata.
+        Default is True.
 
     Returns
     -------
@@ -82,6 +88,7 @@ def validate(
 
     # Check all streams and data keys
     errored_keys, notes = [], []
+    ignore_errors = ignore_errors or []
     streams_node = (
         root_client["streams"] if "streams" in root_client.keys() else root_client
     )
@@ -106,20 +113,24 @@ def validate(
                 )
                 msg = title + f" failed with error: {msg}"
                 logger.error(msg)
-                if raise_on_error:
+                if any(re.search(ptrn, str(e)) for ptrn in ignore_errors):
+                    logger.warning(f"Ignored validation error: {e}")
+                elif raise_on_error:
                     raise e
                 notes.append(msg)
 
             # Validate reading of the data
             if try_reading:
                 try:
-                    validate_reading(data_client, ignore_errors=ignore_errors)
+                    validate_reading(data_client)
                 except Exception as e:
                     errored_keys.append((sname, data_key, str(e)))
                     logger.error(
                         f"Reading validation of '{sname}/{data_key}' failed with error: {e}"
                     )
-                    if raise_on_error:
+                    if any(re.search(ptrn, str(e)) for ptrn in ignore_errors):
+                        logger.warning(f"Ignored reading validation error: {e}")
+                    elif raise_on_error:
                         raise e
 
             time.sleep(0.1)
@@ -130,7 +141,7 @@ def validate(
     # Update the root metadata with validation notes
     for msg in notes:
         logger.warning(msg)
-    if notes:
+    if notes and write_notes:
         existing_notes = root_client.metadata.get("notes", [])
         root_client.update_metadata(
             {"notes": existing_notes + notes}, drop_revision=True
@@ -139,25 +150,19 @@ def validate(
     return not errored_keys
 
 
-def validate_reading(data_client, ignore_errors=[]):
+def validate_reading(data_client):
     """Attempt to read data from the given data client to validate data accessibility
 
     Parameters
     ----------
         data_client : tiled.client.ArrayClient or tiled.client.DataFrameClient
             The data client to validate reading from.
-        ignore_errors : list of str, optional
-            List of error messages to ignore during reading validation.
-            Default is an empty list.
 
     Raises
     ------
         ReadingValidationException
             If reading the data fails with an unignored error.
     """
-
-    data_key = data_client.item["id"]
-    sname = data_client.item["attributes"]["ancestors"][-1]  # stream name
 
     if isinstance(data_client, ArrayClient):
         try:
@@ -167,25 +172,16 @@ def validate_reading(data_client, ignore_errors=[]):
             idx_right_bottom = (-1,) * len(data_client.shape)
             data_client[idx_right_bottom]
         except Exception as e:
-            if any([re.search(msg, str(e)) for msg in ignore_errors]):
-                logger.info(f"Ignoring array reading error: {sname}/{data_key}: {e}")
-            else:
-                raise ReadingValidationException(
-                    f"Array reading failed with error: {e}"
-                )
+            raise ReadingValidationException(f"Array reading failed with error: {e}")
 
     elif isinstance(data_client, DataFrameClient):
         try:
             data_client.read()  # try to read the entire table
         except Exception as e:
-            if any([re.search(msg, str(e)) for msg in ignore_errors]):
-                logger.info(f"Ignoring table reading error: {sname}/{data_key}: {e}")
-            else:
-                raise ReadingValidationException(
-                    f"Table reading failed with error: {e}"
-                )
+            raise ReadingValidationException(f"Table reading failed with error: {e}")
 
     else:
+        data_key = data_client.item["id"]
         logger.warning(
             f"Validation of '{data_key=}' is not supported with client of type {type(data_client)}."
         )
@@ -285,6 +281,50 @@ def validate_data_source(
     true_shape = orig_shape = true_structure.shape
     true_chunks = orig_chunks = true_structure.chunks
 
+    # Check if this might be StructDtype -- this would affect the shape validation
+    if structure.data_type != true_data_type:
+        if not fix_errors:
+            raise StructureValidationException(
+                f"Data type mismatch: {structure.data_type} != {true_data_type}"
+            )
+
+        elif isinstance(structure.data_type, StructDtype):
+            npdt_s = structure.data_type.to_numpy_dtype()
+            npdt_t = true_data_type.to_numpy_dtype()
+            if isinstance(true_data_type, StructDtype):
+                # Both are structural dtypes: use names from structure, dtypes from file
+                if len(npdt_s.names) != len(npdt_t.names):
+                    raise StructureValidationException(
+                        f"Number of fields mismatch in structured dtype: {len(npdt_s.names)} != {len(npdt_t.names)}"  # noqa
+                    )
+                fields = [
+                    (n, f[0]) for n, f in zip(npdt_s.names, npdt_t.fields.values())
+                ]
+
+            elif isinstance(true_data_type, BuiltinDtype):
+                # All columns appear to be of the same dtype, but expected structured
+                if len(npdt_s.names) != true_shape[-1]:
+                    raise StructureValidationException(
+                        f"Number of fields mismatch in structured dtype: {len(npdt_s.names)} != {true_shape[-1]}"  # noqa
+                    )
+                true_shape = (*true_shape[:-1], 1)
+                true_chunks = (*true_chunks[:-1], (1,))
+                fields = [(n, npdt_t) for n in npdt_s.names]
+
+            true_data_type = StructDtype.from_numpy_dtype(numpy.dtype(fields))
+
+        elif isinstance(true_data_type, StructDtype):
+            # Expected a simple builtin dtype, but the file was parsed as structured;
+            # try to cast as BuiltinDtype if possible (common dtype that matches all fields)
+            npdt_t = true_data_type.to_numpy_dtype()
+            common_dtype = numpy.result_type(*[f[0] for f in npdt_t.fields.values()])
+            true_data_type = BuiltinDtype.from_numpy_dtype(common_dtype)
+
+        # Both structure and file have simple built-in dtypes: just use the file dtype
+        msg = f"Fixed dtype mismatch: {structure.data_type.to_numpy_dtype()} -> {true_data_type.to_numpy_dtype()}"  # noqa
+        structure.data_type = true_data_type
+        notes.append(msg)
+
     # If this resource has the `frame_per_point`/`multiplier` parameter, the true shape of
     # the data is expected to be (num_events, multiplier, *rest) and needs to be adjusted,
     # but only if the original shape in the file is divisible by the multiplier.
@@ -304,38 +344,22 @@ def validate_data_source(
             raise StructureValidationException(
                 f"Shape mismatch: {structure.shape} != {true_shape}"
             )
-        else:
-            msg = f"Fixed shape mismatch: {structure.shape} -> {true_shape}"
-            structure.shape = true_shape
-            notes.append(msg)
+
+        msg = f"Fixed shape mismatch: {structure.shape} -> {true_shape}"
+        structure.shape = true_shape
+        notes.append(msg)
 
     if structure.chunks != true_chunks:
         if not fix_errors:
             raise StructureValidationException(
                 f"Chunk shape mismatch: {structure.chunks} != {true_chunks}"
             )
-        else:
-            _true_chunk_shape = tuple(c[0] for c in true_chunks)
-            _chunk_shape = tuple(c[0] for c in structure.chunks)
-            msg = f"Fixed chunk shape mismatch: {_chunk_shape} -> {_true_chunk_shape}"
-            structure.chunks = true_chunks
-            notes.append(msg)
 
-    if structure.data_type != true_data_type:
-        if not fix_errors:
-            raise StructureValidationException(
-                f"Data type mismatch: {structure.data_type} != {true_data_type}"
-            )
-        elif isinstance(structure.data_type, StructDtype):
-            # TODO: implement proper handling of Structured dtype conversions
-            pass
-        else:
-            msg = (
-                f"Fixed dtype mismatch: {structure.data_type.to_numpy_dtype()} "
-                f"-> {true_data_type.to_numpy_dtype()}"
-            )
-            structure.data_type = true_data_type
-            notes.append(msg)
+        _true_chunk_shape = tuple(c[0] for c in true_chunks)
+        _chunk_shape = tuple(c[0] for c in structure.chunks)
+        msg = f"Fixed chunk shape mismatch: {_chunk_shape} -> {_true_chunk_shape}"
+        structure.chunks = true_chunks
+        notes.append(msg)
 
     if structure.dims and (len(structure.dims) != len(true_shape)):
         if not fix_errors:
@@ -343,19 +367,17 @@ def validate_data_source(
                 "Number of dimension names mismatch for a "
                 f"{len(true_shape)}-dimensional array: {structure.dims}"
             )
+
+        old_dims = structure.dims
+        if len(old_dims) < len(true_shape):
+            structure.dims = (
+                ("time",)
+                + old_dims
+                + tuple(f"dim{i}" for i in range(len(old_dims) + 1, len(true_shape)))
+            )
         else:
-            old_dims = structure.dims
-            if len(old_dims) < len(true_shape):
-                structure.dims = (
-                    ("time",)
-                    + old_dims
-                    + tuple(
-                        f"dim{i}" for i in range(len(old_dims) + 1, len(true_shape))
-                    )
-                )
-            else:
-                structure.dims = old_dims[: len(true_shape)]
-            msg = f"Fixed dimension names: {old_dims} -> {structure.dims}"
-            notes.append(msg)
+            structure.dims = old_dims[: len(true_shape)]
+        msg = f"Fixed dimension names: {old_dims} -> {structure.dims}"
+        notes.append(msg)
 
     return data_source, notes

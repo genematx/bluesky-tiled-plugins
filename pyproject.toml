@@ -38,7 +38,7 @@ dependencies = [
   "event-model",
   "mongoquery",
   "pytz",
-  "tiled[client] >=0.1.5",
+  "tiled[client] >=0.2.12",
   "tzlocal",
 ]
 
@@ -58,13 +58,20 @@ BlueskyEventStream = "bluesky_tiled_plugins.clients.bluesky_event_stream:Bluesky
 [dependency-groups]
 test = [
   "bluesky",
+  "databroker",
+  "fakeredis",
   "h5py",
   "jinja2",
+  "mongomock",
   "ophyd",
+  "pymongo",
   "pytest >=6",
   "pytest-cov >=3",
+  "redis",
+  "redis-json-dict",
+  "suitcase-mongo",
   "tifffile",
-  "tiled[server] >=0.2.0",
+  "tiled[server] >=0.2.12",
 ]
 dev = [
   { include-group = "test" },
@@ -99,6 +106,10 @@ addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = true
 filterwarnings = [
   "error",
+  # opentelemetry uses an older importlib_metadata dict API that is deprecated;
+  # this is a third-party issue not in our control.
+  "ignore:SelectableGroups dict interface is deprecated:DeprecationWarning",
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
 ]
 log_level = "INFO"
 testpaths = [
