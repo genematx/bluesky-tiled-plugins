@@ -20,7 +20,6 @@ from ..utils import list_summands
 
 logger = logging.getLogger(__name__)
 
-
 class ValidationException(Exception):
     def __init__(self, message, uid=None):
         super().__init__(message)
@@ -123,6 +122,7 @@ def validate(
             # Validate reading of the data
             if try_reading:
                 try:
+                    print(f"Validating reading of '{sname}/{data_key}'...")
                     validate_reading(data_client)
                 except Exception as e:
                     errored_keys.append((sname, data_key, str(e)))

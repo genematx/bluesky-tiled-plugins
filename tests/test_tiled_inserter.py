@@ -93,10 +93,29 @@ def test_insert_method_alias(RE, mongo_catalog_client):
 @pytest.mark.parametrize(
     "fname, skip_keys",
     [
-        # `internal_events`: the `empty` data key is declared with shape
-        # `[]` but rows have actual shape `(0,)`, which MongoAdapter
-        # can't reshape back to a scalar.
-        ("internal_events", {"empty"}),
+        # `internal_events`:
+        #   `empty`: declared with shape `[]` but rows have actual shape
+        #     `(0,)`, which MongoAdapter can't reshape back to a scalar.
+        #   The fixture also contains a `ragged` data key with shape
+        #     `[2, None]`. `databroker.mongo_normalized` has no
+        #     ragged-array support: `GET /metadata/<run>/primary/data`
+        #     eagerly builds an `ArrayStructure` for every child, and
+        #     dask `normalize_chunks` rejects `None` dims, so the data
+        #     container is unreachable. A per-key skip via `skip_keys`
+        #     is not enough -- we mark this parametrization xfail until
+        #     `mongo_normalized` learns to handle ragged shapes.
+        pytest.param(
+            "internal_events",
+            {"empty", "ragged"},
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "databroker.mongo_normalized cannot build the `data` "
+                    "container when any field has a None dim (ragged)."
+                ),
+                raises=Exception,
+            ),
+        ),
         # `external_assets_legacy`: external data keys reference the
         # `AD_HDF5_SWMR_STREAM` resource spec, for which MongoAdapter's
         # Filler has no handler registered in this test environment.
