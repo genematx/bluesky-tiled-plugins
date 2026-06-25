@@ -708,15 +708,23 @@ class _RunWriter(DocumentRouter):
                 self.notes.append(msg)
 
             # Create a new "internal" array data node or update the existing one
-            if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):
+            if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):                    
                 metadata = truncate_json_overflow(self.data_keys.get(key, {}))
+                try:
+                    array = numpy.array(arr_lst, dtype=metadata.get("dtype_numpy", None))
+                except ValueError as e:
+                    logger.error(f"Error creating numpy array for key '{key}' in stream '{desc_name}': {e}.")
+                    array = numpy.array(arr_lst)
+                    metadata["dtype_numpy"] = str(array.dtype)
+                    logger.warning(f"Falling back to default dtype '{metadata['dtype_numpy']}'")
                 arr_client = desc_node.write_array(
-                    numpy.array(arr_lst, dtype=metadata.get("dtype_numpy", None)),
+                    array,
                     key=key,
                     metadata=metadata,
                     dims=("time", "dim_1"),  # Always 2D
                     access_tags=self.access_tags,
                 )
+
                 self._internal_arrays[f"{desc_name}/{key}"] = arr_client
                 self.notes.append(
                     f"Internal array data for '{key}' in stream '{desc_name}' written as zarr."
@@ -914,7 +922,7 @@ class _RunWriter(DocumentRouter):
                     # it will return 404 Not Found error; in this case, attempt to validate
                     # the data structure locally with the Consolidator.
 
-                    if response.status_code == httpx.codes.NOT_FOUND:
+                    if response.status_code in (httpx.codes.NOT_FOUND, httpx.codes.UNAUTHORIZED):
                         warnings.warn(
                             "Tiled server does not support remote validation. "
                             "Attempting to validate the data structure locally."

@@ -122,6 +122,7 @@ def validate(
             # Validate reading of the data
             if try_reading:
                 try:
+                    print(f"Validating reading of '{sname}/{data_key}'...")
                     validate_reading(data_client)
                 except Exception as e:
                     errored_keys.append((sname, data_key, str(e)))

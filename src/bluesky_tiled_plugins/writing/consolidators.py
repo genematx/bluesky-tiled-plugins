@@ -2,8 +2,6 @@ import collections
 import dataclasses
 import importlib
 import math
-import os
-import re
 import warnings
 from typing import Literal, cast
 from pathlib import Path
@@ -14,8 +12,8 @@ from tiled.mimetypes import DEFAULT_ADAPTERS_BY_MIMETYPE
 from tiled.structures.array import ArrayStructure, BuiltinDtype, StructDtype
 from tiled.structures.core import StructureFamily
 from tiled.structures.data_source import Asset, DataSource, Management
-from tiled.utils import OneShotCachedMap, path_from_uri, ensure_uri
-from ..utils import list_summands
+from tiled.utils import OneShotCachedMap, path_from_uri
+from ..utils import compile_template, list_summands
 
 # User-provided adapters take precedence over defaults.
 CUSTOM_ADAPTERS_BY_MIMETYPE = OneShotCachedMap[str, type](
@@ -26,14 +24,15 @@ CUSTOM_ADAPTERS_BY_MIMETYPE = OneShotCachedMap[str, type](
         "application/x-hdf5;type=xia-xmap": lambda: importlib.import_module(
             "mng2sql.adapters.xiaxmap", __name__
         ).XIAxMAPAdapter,
-        "application/x-hdf5;type=eiger-mx": lambda: importlib.import_module(
+        "application/x-hdf5;type=eiger": lambda: importlib.import_module(
             "mng2sql.adapters.eigermx", __name__
-        ).EigerMXAdapter,
+        ).EigerHDF5Adapter,
     }
 )
 DEFAULT_ADAPTERS_BY_MIMETYPE = collections.ChainMap(
     CUSTOM_ADAPTERS_BY_MIMETYPE, DEFAULT_ADAPTERS_BY_MIMETYPE
 )
+
 
 
 @dataclasses.dataclass
@@ -119,6 +118,7 @@ class ConsolidatorBase:
     """
 
     supported_mimetypes: set[str] = {"application/octet-stream"}
+    asset_role: str = "data_uris"  # Default parameter (role) for the asset(s)
     join_method: Literal["stack", "concat"] = "concat"
     join_chunks: bool = True
 
@@ -131,7 +131,7 @@ class ConsolidatorBase:
             self.assets: list[Asset] = [Asset(data_uri=self.uri, is_directory=False, parameter="data_uri")]
         else:
             self.assets: list[Asset] = [
-                Asset(data_uri=self.uri, is_directory=False, parameter="data_uris", num=0)
+                Asset(data_uri=self.uri, is_directory=False, parameter=self.asset_role, num=0)
             ]
         self._sres_parameters = stream_resource["parameters"]
         self._indx_offset = 0  # To reset file index for each new StreamResource
@@ -651,13 +651,22 @@ class CSVConsolidator(ConsolidatorBase):
 
 
 class HDF5Consolidator(ConsolidatorBase):
-    supported_mimetypes = {"application/x-hdf5", "application/x-hdf5;type=xia-xmap", "application/x-hdf5;type=eiger-mx"}
+    supported_mimetypes = {"application/x-hdf5"}
+
+    def __new__(cls, stream_resource: StreamResource, descriptor: EventDescriptor):
+        if stream_resource["parameters"].get("template"):
+            return MultipartHDF5Consolidator(stream_resource, descriptor)
+        return super().__new__(cls)
 
     def adapter_parameters(self) -> dict:
         """Parameters to be passed to the HDF5 adapter, a dictionary with the keys:
 
-        dataset: list[str] - a path to the dataset within the hdf5 file represented as list split at `/`
+        dataset: str -- a path to the dataset within the hdf5 file
         swmr: bool -- True to enable the single writer / multiple readers regime
+        locking: Optional[bool] -- True to enable file locking, False to disable,
+            None to auto-detect (default)
+        slice: Optional[tuple[str, ...]] -- a tuple of slice strings to select a subset of the dataset
+        squeeze: bool -- whether to squeeze the dataset after slicing (default False)
         """
         params = {"dataset": self._sres_parameters["dataset"]}
         if slice := self._sres_parameters.get("slice", False):
@@ -686,135 +695,37 @@ class HDF5Consolidator(ConsolidatorBase):
         asset = Asset(
             data_uri=stream_resource["uri"],
             is_directory=False,
-            parameter="data_uris",
+            parameter=self.asset_role,
             num=len(self.assets),
         )
         self.assets.append(asset)
-
-    def validate(self, fix_errors=False) -> list[str]:
-        if (self._sres_parameters.get("_resource_spec") == 'AD_EIGER_MX') \
-            and (self._sres_parameters.get("data_key") == "data"):
-            # Special handling for NexusMX HDF5 files where data is stored in several linked files
-            if len(self.assets) != 1:
-                raise ValueError("NexusMX HDF5 dataset must be referenced by a single master file.")
-            master_uri = self.assets[0].data_uri
-            master_fpath = path_from_uri(master_uri)
-            self.assets.clear()
-
-            # Repopulate assets based on the linked files
-            import h5py
-
-            with h5py.File(master_fpath, 'r') as f:
-                for i, key in enumerate(f['/entry/data'].keys()):
-                    link = f['/entry/data'].get(key, getlink=True)
-                    self.assets.append(
-                        Asset(
-                            data_uri=ensure_uri(master_fpath.with_name(link.filename)),
-                            is_directory=False,
-                            parameter="data_uris",
-                            num=i,
-                        )
-                    )
-                    self._sres_parameters['dataset'] = link.path  # assume all links point to the same dataset path
-        
-            # Proceed with usual validation
-            notes = super().validate(fix_errors=fix_errors)
-
-            # Keep the master file as a separate asset
-            self.assets.append(Asset(data_uri=master_uri, is_directory=False, parameter="master"))
-
-            msg = "Added linked files to the set of assets."
-            warnings.warn(msg, stacklevel=2)
-            notes.append(msg)
-        else:
-            notes = super().validate(fix_errors=fix_errors)
-
-        return notes
 
 
 class MultipartRelatedConsolidator(ConsolidatorBase):
     def __init__(
         self,
-        permitted_extensions: set[str],
         stream_resource: StreamResource,
         descriptor: EventDescriptor,
     ):
         super().__init__(stream_resource, descriptor)
-        self.permitted_extensions: set[str] = permitted_extensions
         self.assets.clear()  # Assets will be populated based on datum indices
         self.data_uris: list[str] = []
-        self.chunk_shape = self.chunk_shape or (
-            1,
-        )  # I.e. number of frames per file (tiff, jpeg, etc.)
-        if self.join_method == "concat":
-            assert self.datum_shape[0] % self.chunk_shape[0] == 0, (
-                f"Number of frames per file ({self.chunk_shape[0]}) must divide the total number of frames per "
-                f"datum ({self.datum_shape[0]}): variable-sized files are not allowed."
-            )
+        self.chunk_shape = self.chunk_shape or (1,)  # num frames per file
+
+        # Ensure that the number of frames per file divides teh number of frames per datum.
+        if (self.join_method == "concat") and (self.datum_shape[0] % self.chunk_shape[0] != 0):
+            self.chunk_shape = (self.datum_shape[0],)
+
+        self.files_per_datum = self._sres_parameters.get("files_per_datum") or (
+            self.datum_shape[0] // self.chunk_shape[0]
+            if self.join_method == "concat"
+            else self.metadata.get("frame_per_point", 1)
+        )
 
         # Compile and set the filename template
-        self.template = self._compile_template(
+        self.template = compile_template(
             self._sres_parameters["template"], self._sres_parameters.get("filename", "")
         )
-
-    @staticmethod
-    def _compile_template(template: str, filename: str = "") -> str:
-        """Compile a filename template from old-style to new-style Python formatting
-
-        Parameters
-        ----------
-        template : str
-            An old-style Python formatting string, e.g. "%s%s_%06d.tif
-        filename : str
-            An optional filename to substitute for the first %s in the template.
-
-        Returns
-        -------
-            A new-style Python formatting string, e.g. "filename_{:06d}.tif"
-        """
-
-        def int_replacer(match):
-            """Normalize filename template
-
-            Replace an integer format specifier with a new-style format specifier,
-            i.e. convert the template string from "old" to "new" Python style,
-            e.g. "%s%s_%06d.tif" to "filename_{:06d}.tif"
-
-            """
-            flags, width, precision, type_char = match.groups()
-
-            # Handle the flags
-            flag_str = ""
-            if "-" in flags:
-                flag_str = "<"  # Left-align
-            if "+" in flags:
-                flag_str += "+"  # Show positive sign
-            elif " " in flags:
-                flag_str += " "  # Space before positive numbers
-            if "0" in flags:
-                flag_str += "0"  # Zero padding
-
-            # Build width and precision if they exist
-            width_str = width if width else ""
-            precision_str = f".{precision}" if precision else ""
-
-            # Handle cases like "%6.6d", which should be converted to "{:06d}"
-            if precision and width:
-                flag_str = "0"
-                precision_str = ""
-                width_str = str(max(precision, width))
-
-            # Construct the new-style format specifier
-            return f"{{:{flag_str}{width_str}{precision_str}{type_char}}}"
-
-        result = (
-            template.replace("%s", "{:s}", 1)
-            .replace("%s", "")
-            .replace("{:s}", filename, 1)
-        )
-        result = re.sub(r"%([-+#0 ]*)(\d+)?(?:\.(\d+))?([d])", int_replacer, result)
-
-        return result
 
     def get_datum_uri(self, indx: int):
         """Return a full uri for a datum (an individual image file) based on its index in the sequence.
@@ -828,7 +739,6 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         """
 
         if self.template:
-            assert os.path.splitext(self.template)[1] in self.permitted_extensions
             return self.uri + self.template.format(indx - self._indx_offset)
         return self.uri
 
@@ -845,19 +755,14 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         of the resulting dataset, and hence corresponds to a single file.
         """
 
-        files_per_datum = (
-            self.datum_shape[0] // self.chunk_shape[0]
-            if self.join_method == "concat"
-            else self.metadata.get("frame_per_point", 1)
-        )
-        first_file_indx = doc["indices"]["start"] * files_per_datum
-        last_file_indx = doc["indices"]["stop"] * files_per_datum
+        first_file_indx = doc["indices"]["start"] * self.files_per_datum
+        last_file_indx = doc["indices"]["stop"] * self.files_per_datum
         for indx in range(first_file_indx, last_file_indx):
             new_datum_uri = self.get_datum_uri(indx)
             new_asset = Asset(
                 data_uri=new_datum_uri,
                 is_directory=False,
-                parameter="data_uris",
+                parameter=self.asset_role,
                 num=len(self.assets),
             )
             self.assets.append(new_asset)
@@ -869,25 +774,26 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         """Add an Asset for a new StreamResource document"""
 
         self._sres_parameters = stream_resource["parameters"]
-        self.template = self._compile_template(
+        self.template = compile_template(
             self._sres_parameters["template"], self._sres_parameters.get("filename", "")
         )
         # Reset the file index counter to start from "0" for the new StreamResource template
         self._indx_offset = len(self.assets)
 
 
+class MultipartHDF5Consolidator(MultipartRelatedConsolidator):
+    supported_mimetypes = {"application/x-hdf5"}
+
+    def adapter_parameters(self) -> dict:
+        return HDF5Consolidator.adapter_parameters(self)
+
+
 class TIFFConsolidator(MultipartRelatedConsolidator):
     supported_mimetypes = {"multipart/related;type=image/tiff"}
-
-    def __init__(self, stream_resource: StreamResource, descriptor: EventDescriptor):
-        super().__init__({".tif", ".tiff"}, stream_resource, descriptor)
 
 
 class JPEGConsolidator(MultipartRelatedConsolidator):
     supported_mimetypes = {"multipart/related;type=image/jpeg"}
-
-    def __init__(self, stream_resource: StreamResource, descriptor: EventDescriptor):
-        super().__init__({".jpeg", ".jpg"}, stream_resource, descriptor)
 
 
 class NPYConsolidator(MultipartRelatedConsolidator):
@@ -906,7 +812,7 @@ class NPYConsolidator(MultipartRelatedConsolidator):
         data_key = stream_resource["data_key"]
         datum_shape = descriptor["data_keys"][data_key]["shape"]
         stream_resource["parameters"]["chunk_shape"] = (1, *datum_shape)
-        super().__init__({".npy"}, stream_resource, descriptor)
+        super().__init__(stream_resource, descriptor)
 
 
 class PizzaBoxConsolidator(ConsolidatorBase):
