@@ -98,7 +98,7 @@ def external_assets_folder(tmp_path_factory):
                 "data", data=rng.random(size=(1, 13, 17), dtype="float64")
             )
 
-    # Create a second external hdf5 file to be declared in a different stream resource
+    # Create another external hdf5 file to be declared in a different stream resource
     with h5py.File(temp_dir.joinpath("dataset_part2.h5"), "w") as file:
         grp = file.create_group("entry").create_group("data")
         grp.create_dataset(
@@ -110,6 +110,14 @@ def external_assets_folder(tmp_path_factory):
     for i in range(3):
         data = rng.integers(0, 255, size=(1, 10, 15), dtype="uint8")
         tf.imwrite(temp_dir.joinpath("tiff_files", f"img_{i:05}.tif"), data)
+
+    # Create an opaque binary blob (single-file bytes stream) and a
+    # sequence of blobs (multi-file bytes stream with a filename template).
+    temp_dir.joinpath("blob.bin").write_bytes(b"\x00\x01\x02opaque-blob\xff")
+    (temp_dir / "blob_files").mkdir(parents=True, exist_ok=True)
+    for i in range(3):
+        payload = f"payload-{i}".encode() + bytes([i])
+        temp_dir.joinpath("blob_files", f"blob_{i:05d}.bin").write_bytes(payload)
 
     return str(temp_dir.absolute()).replace("\\", "/")
 
