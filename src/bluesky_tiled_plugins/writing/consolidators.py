@@ -119,7 +119,7 @@ class ConsolidatorBase:
     """
 
     supported_mimetypes: set[str] = {"application/octet-stream"}
-    asset_role: str = "data_uris"  # Default parameter (role) for the asset(s)
+    default_asset_role: str = "data_uris"  # Default parameter (role) for the asset(s)
     join_method: Literal["stack", "concat"] = "concat"
     join_chunks: bool = True
 
@@ -132,7 +132,7 @@ class ConsolidatorBase:
             self.assets: list[Asset] = [Asset(data_uri=self.uri, is_directory=False, parameter="data_uri")]
         else:
             self.assets: list[Asset] = [
-                Asset(data_uri=self.uri, is_directory=False, parameter=self.asset_role, num=0)
+                Asset(data_uri=self.uri, is_directory=False, parameter=self.default_asset_role, num=0)
             ]
         self._sres_parameters = stream_resource["parameters"]
         self._indx_offset = 0  # To reset file index for each new StreamResource
@@ -560,7 +560,7 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
             new_asset = Asset(
                 data_uri=self.get_datum_uri(indx),
                 is_directory=False,
-                parameter=self.asset_role,
+                parameter=self.default_asset_role,
                 num=len(self.assets),
             )
             self.assets.append(new_asset)
@@ -580,7 +580,7 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
 
 class BytesConsolidator:
     supported_mimetypes = {"application/octet-stream"}
-    asset_role = "data_uris"  # Default parameter (role) for the asset(s)
+    default_asset_role = "data_uris"  # Default parameter (role) for the asset(s)
 
     def __init__(self, stream_resource: StreamResource, descriptor: EventDescriptor):
         self.mimetype: str = self.get_supported_mimetype(stream_resource)
@@ -626,7 +626,7 @@ class BytesConsolidator:
             new_asset = Asset(
                 data_uri=self.get_datum_uri(indx),
                 is_directory=False,
-                parameter=self.asset_role,
+                parameter=self.default_asset_role,
                 num=len(self.assets),
             )
             self.assets.append(new_asset)
@@ -853,7 +853,7 @@ class HDF5Consolidator(ConsolidatorBase):
         asset = Asset(
             data_uri=stream_resource["uri"],
             is_directory=False,
-            parameter=self.asset_role,
+            parameter=self.default_asset_role,
             num=len(self.assets),
         )
         self.assets.append(asset)
