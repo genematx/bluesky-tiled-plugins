@@ -318,7 +318,13 @@ def collect_plan(*objs, name="primary"):
 
 
 @pytest.mark.parametrize(
-    "fname", ["internal_events", "external_assets", "external_assets_legacy"]
+    "fname",
+    [
+        "internal_events",
+        "external_assets",
+        "external_assets_legacy",
+        "external_assets_multipart_hdf5",
+    ],
 )
 @pytest.mark.parametrize("batch_size", [0, 1, 1000, None])
 @pytest.mark.filterwarnings(
