@@ -80,7 +80,7 @@ JSON_TO_NUMPY_DTYPE = {
 
 # A lookup table for converting Bluesky spec names to MIME types
 MIMETYPE_LOOKUP = defaultdict(
-    lambda: "application/octet-stream",
+    lambda: "application/unknown",
     {
         "HDF5": "application/x-hdf5",
         "AD_HDF5": "application/x-hdf5",
@@ -288,6 +288,9 @@ class RunNormalizer(DocumentRouter):
             stream_resource_doc["uri"] = "file://localhost/" + str(file_path).lstrip(
                 "/"
             )
+
+            # Keep the Bluesky spec name in parameters
+            stream_resource_doc["parameters"]["spec"] = resource_spec
 
             # Add the internal path within HDF5 files to the parameters for known Bluesky specs
             existing_dataset = stream_resource_doc["parameters"].get("dataset")
@@ -1076,10 +1079,11 @@ class _RunWriter(DocumentRouter):
                 consolidator.update_from_stream_resource(sres_doc)
             else:
                 consolidator = consolidator_factory(sres_doc, desc_node.metadata)
+                data_source = consolidator.get_data_source()
                 sres_node = desc_node.new(
                     key=consolidator.data_key,
-                    structure_family=StructureFamily.array,
-                    data_sources=[consolidator.get_data_source()],
+                    structure_family=data_source.structure_family,
+                    data_sources=[data_source],
                     metadata={},
                     specs=[],
                     access_tags=self.access_tags,

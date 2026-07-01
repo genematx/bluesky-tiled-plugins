@@ -38,7 +38,7 @@ dependencies = [
   "event-model",
   "mongoquery",
   "pytz",
-  "tiled[client] >=0.2.12",
+  "tiled[client] >=0.1.5",
   "tzlocal",
 ]
 
@@ -71,7 +71,7 @@ test = [
   "redis-json-dict",
   "suitcase-mongo",
   "tifffile",
-  "tiled[server] >=0.2.12",
+  "tiled[server] >=0.1.5",
 ]
 dev = [
   { include-group = "test" },
