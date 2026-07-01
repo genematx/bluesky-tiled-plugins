@@ -1,16 +1,40 @@
 import collections
 import dataclasses
+import importlib
+import math
 import warnings
-from typing import Literal, cast
+from typing import Literal, cast, Optional
+from pathlib import Path
 
 import numpy as np
 from event_model.documents import EventDescriptor, StreamDatum, StreamResource
 from tiled.mimetypes import DEFAULT_ADAPTERS_BY_MIMETYPE
+from tiled.storage import size_from_uri
 from tiled.structures.array import ArrayStructure, BuiltinDtype, StructDtype
+from tiled.structures.bytes import BytesStructure
 from tiled.structures.core import StructureFamily
 from tiled.structures.data_source import Asset, DataSource, Management
-
+from tiled.utils import OneShotCachedMap, path_from_uri
 from ..utils import compile_template, list_summands
+
+# User-provided adapters take precedence over defaults.
+CUSTOM_ADAPTERS_BY_MIMETYPE = OneShotCachedMap[str, type](
+    {
+        "application/x-pizzabox-binary": lambda: importlib.import_module(
+            "mng2sql.adapters.pizzabox", __name__
+        ).PizzaBoxAdapter,
+        "application/x-hdf5;type=xia-xmap": lambda: importlib.import_module(
+            "mng2sql.adapters.xiaxmap", __name__
+        ).XIAxMAPAdapter,
+        "application/x-hdf5;type=eiger": lambda: importlib.import_module(
+            "mng2sql.adapters.eiger", __name__
+        ).EigerHDF5Adapter,
+    }
+)
+DEFAULT_ADAPTERS_BY_MIMETYPE = collections.ChainMap(
+    CUSTOM_ADAPTERS_BY_MIMETYPE, DEFAULT_ADAPTERS_BY_MIMETYPE
+)
+
 
 
 @dataclasses.dataclass
@@ -96,6 +120,7 @@ class ConsolidatorBase:
     """
 
     supported_mimetypes: set[str] = {"application/octet-stream"}
+    default_asset_role: str = "data_uris"  # Default parameter (role) for the asset(s)
     join_method: Literal["stack", "concat"] = "concat"
     join_chunks: bool = True
 
@@ -104,14 +129,24 @@ class ConsolidatorBase:
 
         self.data_key = stream_resource["data_key"]
         self.uri = stream_resource["uri"]
-        self.assets: list[Asset] = [
-            Asset(data_uri=self.uri, is_directory=False, parameter="data_uris", num=0)
-        ]
+        if self.mimetype in {"image/jpeg", "image/tiff"}:
+            self.assets: list[Asset] = [Asset(data_uri=self.uri, is_directory=False, parameter="data_uri")]
+        else:
+            self.assets: list[Asset] = [
+                Asset(
+                    data_uri=self.uri,
+                    is_directory=False,
+                    parameter=self.default_asset_role,
+                    num=0,
+                )
+            ]
         self._sres_parameters = stream_resource["parameters"]
         self._indx_offset = 0  # To reset file index for each new StreamResource
 
         # Any metadata to be set on the corresponding node in Tiled
         self.metadata: dict = {}
+        if spec := self._sres_parameters.get("spec"):
+            self.metadata["spec"] = spec
 
         # Find datum shape and machine dtype
         data_desc = descriptor["data_keys"][self.data_key]
@@ -352,6 +387,13 @@ class ConsolidatorBase:
         # Initialize adapter from uris and determine the structure
         adapter_class = DEFAULT_ADAPTERS_BY_MIMETYPE[self.mimetype]
         uris = [asset.data_uri for asset in self.assets]
+
+        # Check that the files exist
+        for uri in uris:
+            fpath = Path(path_from_uri(uri))
+            if not fpath.exists() or (fpath.is_file() and fpath.stat().st_size == 0):
+                raise FileNotFoundError(2, "No such file or directory or it is empty", str(fpath))
+
         structure = adapter_class.from_uris(
             *uris, **self.adapter_parameters()
         ).structure()
@@ -465,6 +507,108 @@ class ConsolidatorBase:
         return self.init_adapter(adapter_class=adapter_class)
 
 
+class BytesConsolidator:
+    """Consolidator for opaque binary files registered as the `bytes` structure family.
+
+    Unlike `ConsolidatorBase`, this consolidator does not interpret or reshape
+    the data: each StreamDatum yields one or more `Asset`s carrying a file URI,
+    and the corresponding Tiled node is a `bytes` node whose data can be
+    downloaded but not sliced or read as an array.
+    """
+
+    supported_mimetypes: set[str] = {"application/octet-stream"}
+    default_asset_role: str = "data_uris"  # Default parameter (role) for the asset(s)
+
+    def __init__(self, stream_resource: StreamResource, descriptor: EventDescriptor):
+        self.mimetype: str = self.get_supported_mimetype(stream_resource)
+        self.metadata: dict = {}
+        self.template: Optional[str] = None
+        self.data_key: str = stream_resource["data_key"]
+        self.uri: str = stream_resource["uri"]
+        self.assets: list[Asset] = []
+        self._indx_offset: int = 0
+
+        self.update_from_stream_resource(stream_resource)
+
+        # Preserve the originating Bluesky spec (if any) as metadata
+        if spec := stream_resource["parameters"].get("spec"):
+            self.metadata["spec"] = spec
+
+    @classmethod
+    def get_supported_mimetype(cls, sres):
+        if sres["mimetype"] not in cls.supported_mimetypes:
+            raise ValueError(
+                f"A data source of {sres['mimetype']} type can not be handled by {cls.__name__}."
+            )
+        return sres["mimetype"]
+
+    def get_datum_uri(self, indx: int):
+        """Return a full uri for a datum (an individual file) based on its index in the sequence.
+
+        This relies on the `template` parameter passed in the StreamResource, which is a string in the "new"
+        Python formatting style that can be evaluated to a file name using the `.format(indx)` method given an
+        integer index, e.g. "{:05d}.ext".
+
+        If template is not set, we assume that the uri is provided directly in the StreamResource document (i.e.
+        a single file case), and return it as is.
+        """
+
+        if self.template:
+            return self.uri + self.template.format(indx - self._indx_offset)
+        return self.uri
+
+    def consume_stream_datum(self, doc: StreamDatum):
+        """Register one Asset per file index in the incoming StreamDatum."""
+        first_file_indx = doc["indices"]["start"]
+        last_file_indx = doc["indices"]["stop"]
+        for indx in range(first_file_indx, last_file_indx):
+            new_asset = Asset(
+                data_uri=self.get_datum_uri(indx),
+                is_directory=False,
+                parameter=self.default_asset_role,
+                num=len(self.assets),
+            )
+            self.assets.append(new_asset)
+
+        return Patch(
+            offset=(first_file_indx,), shape=(last_file_indx - first_file_indx,)
+        )
+
+    def update_from_stream_resource(self, stream_resource: StreamResource):
+        "Update the consolidator with a new StreamResource document"
+
+        self._sres_parameters = stream_resource["parameters"]
+        if template := self._sres_parameters.get("template"):
+            filename = self._sres_parameters.get("filename", "")
+            self.template = compile_template(template, filename)
+
+        # Reset the file index counter to start from "0" for the new StreamResource template
+        self._indx_offset = len(self.assets)
+
+    def validate(self, fix_errors: bool = False) -> list[str]:
+        """Verify each registered asset is reachable; bytes payloads are otherwise opaque."""
+        from .validator import AssetValidationException
+
+        for ast in self.assets:
+            try:
+                size_from_uri(ast.data_uri)
+            except (FileNotFoundError, OSError, ValueError) as e:
+                raise AssetValidationException(
+                    f"Could not determine size of asset {ast.data_uri}: {e}"
+                ) from e
+        return []
+
+    def get_data_source(self) -> DataSource:
+        return DataSource(
+            mimetype=self.mimetype,
+            assets=self.assets,
+            structure_family=StructureFamily.bytes,
+            structure=BytesStructure(),
+            parameters={},
+            properties={},
+            management=Management.external,
+        )
+
 class CSVConsolidator(ConsolidatorBase):
     supported_mimetypes: set[str] = {"text/csv;header=absent"}
     join_method: Literal["stack", "concat"] = "concat"
@@ -490,6 +634,131 @@ class CSVConsolidator(ConsolidatorBase):
             for k, v in {"header": None, **self._sres_parameters}.items()
             if k in allowed_keys
         }
+
+    def validate(self, fix_errors=False) -> list[str]:
+        # CSVConsolidator needs special handling to validate the structure when the data_type is StructDtype.
+        # In this case, we need to check that the number of columns, their names and dtypes match.
+        # The shape and chunks are also validated.
+        # If data_type is BuiltinDtype, we can rely on the base class implementation.
+
+        if isinstance(self.data_type, StructDtype):
+            from tiled.adapters.csv import CSVAdapter
+            import pyarrow.types as patypes
+
+            uris = [asset.data_uri for asset in self.assets]
+            adapter = CSVAdapter.from_uris(
+                uris[0], **self.adapter_parameters()
+            )  # Initialize from the first file
+            column_dtypes = adapter.structure().arrow_schema_decoded.types
+            notes = []
+
+            if len(column_dtypes) != len(self.data_type.fields):
+                raise ValueError(
+                    f"Number of columns mismatch: {len(column_dtypes)} != {len(self.data_type.fields)}"
+                )
+
+            # Construct the true StructDtype of the data as read by the adapter
+            true_column_names_dtypes = []
+            for indx, expected, true_column_dtype in zip(range(len(self.data_type.fields)), self.data_type.fields, column_dtypes):
+                if patypes.is_string(true_column_dtype) or patypes.is_large_string(true_column_dtype):
+                    _true_dtype = np.array([str(x) for x in adapter.read(indx)]).dtype   # becomes "<Un" dtype
+                else:
+                    _true_dtype = true_column_dtype.to_pandas_dtype()
+                true_column_names_dtypes.append((expected.name, _true_dtype))
+
+            true_numpy_dtype = np.dtype(true_column_names_dtypes)
+            true_dtype = StructDtype.from_numpy_dtype(true_numpy_dtype)
+
+            if self.data_type != true_dtype:
+                if not fix_errors:
+                    raise ValueError(
+                        f"dtype mismatch: {self.data_type} != {true_dtype}"
+                    )
+                else:
+                    msg = f"Fixed dtype mismatch: {self.data_type.to_numpy_dtype()} -> {true_numpy_dtype}"  # noqa
+                    warnings.warn(msg, stacklevel=2)
+                    self.data_type = true_dtype
+                    notes.append(msg)
+
+            # Get the shape and chunk shape by reading the first column of the CSV file
+            nrows, npartitions = len(adapter.read([0])), adapter.structure().npartitions
+            dim0_chunks = list_summands(nrows, math.ceil(nrows / npartitions))
+            # If there are multiple files, add their chunks as well
+            for uri in uris[1:]:
+                adapter = CSVAdapter.from_uris(uri, **self.adapter_parameters())
+                nrows, npartitions = (
+                    len(adapter.read([0])),
+                    adapter.structure().npartitions,
+                )
+                dim0_chunks = (
+                    *dim0_chunks,
+                    *list_summands(nrows, math.ceil(nrows / npartitions)),
+                )
+            # Determine the true shape and chunks for the entire dataset
+            true_shape, true_chunks = (sum(dim0_chunks), 1), (dim0_chunks, (1,))
+
+            if self.shape != true_shape:
+                if not fix_errors:
+                    raise ValueError(f"Shape mismatch: {self.shape} != {true_shape}")
+                else:
+                    msg = f"Fixed shape mismatch: {self.shape} -> {true_shape}"
+                    warnings.warn(msg, stacklevel=2)
+                    self._num_rows = true_shape[0]
+                    self.datum_shape = (1, 1) if self.join_method == "concat" else (1,)
+                    notes.append(msg)
+
+            if self.chunks != true_chunks:
+                if not fix_errors:
+                    raise ValueError(
+                        f"Chunk shape mismatch: {self.chunks} != {true_chunks}"
+                    )
+                else:
+                    if len(true_chunks[0]) == 1 or (
+                        len(set(true_chunks[0][:-1])) == 1
+                        and (true_chunks[0][-1] <= true_chunks[0][0])
+                    ):
+                        # Either single chunk or all chunks except possibly the last one are the same (larger) size
+                        _chunk_shape = tuple(c[0] for c in true_chunks)
+                        msg = f"Fixed chunk shape mismatch: {self.chunk_shape} -> {_chunk_shape}"
+                        warnings.warn(msg, stacklevel=2)
+                        self.chunk_shape = _chunk_shape
+                        self.join_chunks = True
+                        notes.append(msg)
+                    else:
+                        msg = f"Fixed chunk shape mismatch along the leading dimension: {true_chunks[0]}"
+                        warnings.warn(msg, stacklevel=2)
+                        self.chunks = true_chunks
+                        notes.append(msg)
+
+            if self.dims and (len(self.dims) != len(true_shape)):
+                if not fix_errors:
+                    raise ValueError(
+                        "Number of dimension names mismatch for a "
+                        f"{len(true_shape)}-dimensional array: {self.dims}"
+                    )
+                else:
+                    old_dims = self.dims
+                    if len(old_dims) < len(true_shape):
+                        self.dims = (
+                            ("time",)
+                            + old_dims
+                            + tuple(
+                                f"dim{i}"
+                                for i in range(len(old_dims) + 1, len(true_shape))
+                            )
+                        )
+                    else:
+                        self.dims = old_dims[: len(true_shape)]
+                    msg = f"Fixed dimension names: {old_dims} -> {self.dims}"
+                    warnings.warn(msg, stacklevel=2)
+                    notes.append(msg)
+
+            assert self.get_adapter() is not None, "Adapter can not be initialized"
+
+        else:
+            notes = super().validate(fix_errors=fix_errors)
+
+        return notes
 
 
 class HDF5Consolidator(ConsolidatorBase):
@@ -537,7 +806,7 @@ class HDF5Consolidator(ConsolidatorBase):
         asset = Asset(
             data_uri=stream_resource["uri"],
             is_directory=False,
-            parameter="data_uris",
+            parameter=self.default_asset_role,
             num=len(self.assets),
         )
         self.assets.append(asset)
@@ -551,19 +820,39 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
     ):
         super().__init__(stream_resource, descriptor)
         self.assets.clear()  # Assets will be populated based on datum indices
-        self.data_uris: list[str] = []
-        self.chunk_shape = self.chunk_shape or (
-            1,
-        )  # I.e. number of frames per file (tiff, jpeg, etc.)
-        if self.join_method == "concat":
-            assert self.datum_shape[0] % self.chunk_shape[0] == 0, (
-                f"Number of frames per file ({self.chunk_shape[0]}) must divide the total number of frames per "
-                f"datum ({self.datum_shape[0]}): variable-sized files are not allowed."
+        self.chunk_shape = self.chunk_shape or (1,)  # num frames per file
+
+        # Ensure that the number of frames per file divides the number of frames per datum;
+        # if not, silently coerce to a single file per datum but warn.
+        if (self.join_method == "concat") and (
+            self.datum_shape[0] % self.chunk_shape[0] != 0
+        ):
+            warnings.warn(
+                f"Number of frames per file ({self.chunk_shape[0]}) does not divide "
+                f"the total number of frames per datum ({self.datum_shape[0]}); "
+                f"coercing chunk_shape to ({self.datum_shape[0]},) (one file per datum).",
+                stacklevel=2,
             )
+            self.chunk_shape = (self.datum_shape[0],)
+
+        self._recompute_files_per_datum()
 
         # Compile and set the filename template
         self.template = compile_template(
             self._sres_parameters["template"], self._sres_parameters.get("filename", "")
+        )
+
+    def _recompute_files_per_datum(self):
+        """Refresh cached files_per_datum from current sres_parameters and shape.
+
+        Called at __init__ and again on each `update_from_stream_resource` so a
+        subsequent StreamResource with a different `files_per_datum` (or implied
+        by chunking) is honored.
+        """
+        self.files_per_datum = self._sres_parameters.get("files_per_datum") or (
+            self.datum_shape[0] // self.chunk_shape[0]
+            if self.join_method == "concat"
+            else self.metadata.get("frame_per_point", 1)
         )
 
     def get_datum_uri(self, indx: int):
@@ -594,23 +883,16 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         of the resulting dataset, and hence corresponds to a single file.
         """
 
-        files_per_datum = (
-            self.datum_shape[0] // self.chunk_shape[0]
-            if self.join_method == "concat"
-            else self.metadata.get("frame_per_point", 1)
-        )
-        first_file_indx = doc["indices"]["start"] * files_per_datum
-        last_file_indx = doc["indices"]["stop"] * files_per_datum
+        first_file_indx = doc["indices"]["start"] * self.files_per_datum
+        last_file_indx = doc["indices"]["stop"] * self.files_per_datum
         for indx in range(first_file_indx, last_file_indx):
-            new_datum_uri = self.get_datum_uri(indx)
             new_asset = Asset(
-                data_uri=new_datum_uri,
+                data_uri=self.get_datum_uri(indx),
                 is_directory=False,
-                parameter="data_uris",
+                parameter=self.default_asset_role,
                 num=len(self.assets),
             )
             self.assets.append(new_asset)
-            self.data_uris.append(new_datum_uri)
 
         return super().consume_stream_datum(doc)
 
@@ -621,6 +903,7 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         self.template = compile_template(
             self._sres_parameters["template"], self._sres_parameters.get("filename", "")
         )
+        self._recompute_files_per_datum()
         # Reset the file index counter to start from "0" for the new StreamResource template
         self._indx_offset = len(self.assets)
 
@@ -659,14 +942,46 @@ class NPYConsolidator(MultipartRelatedConsolidator):
         super().__init__(stream_resource, descriptor)
 
 
+class PizzaBoxConsolidator(ConsolidatorBase):
+    supported_mimetypes: set[str] = {"application/x-pizzabox-binary"}
+
+    def validate(self, fix_errors=False) -> list[str]:
+        notes = super().validate(fix_errors=fix_errors)
+
+        # Initialize adapter from uris and try to locate missing files
+        adapter_class = DEFAULT_ADAPTERS_BY_MIMETYPE[self.mimetype]
+        uris = [asset.data_uri for asset in self.assets]
+        uri_bin, uri_txt = adapter_class.locate_files(*uris)
+
+        if uri_txt and uris == [uri_bin]:
+            if not fix_errors:
+                raise ValueError(
+                    f"Missing asset for PizzaBox binary metadata file: {uri_txt}"
+                )
+            else:
+                self.assets.append(
+                    Asset(data_uri=uri_txt, is_directory=False, parameter="metadata")
+                )
+                msg = f"Registered missing asset for PizzaBox binary metadata file: {uri_txt.split('/')[-1]}"
+                warnings.warn(msg, stacklevel=2)
+                notes.append(msg)
+
+        assert self.init_adapter() is not None, "Adapter can not be initialized"
+
+        return notes
+
+
 CONSOLIDATOR_REGISTRY = collections.defaultdict(
     lambda: ConsolidatorBase,
     {
+        "application/octet-stream": BytesConsolidator,
         "text/csv;header=absent": CSVConsolidator,
         "application/x-hdf5": HDF5Consolidator,
         "multipart/related;type=image/tiff": TIFFConsolidator,
         "multipart/related;type=image/jpeg": JPEGConsolidator,
         "multipart/related;type=application/x-npy": NPYConsolidator,
+        "application/x-pizzabox-binary": PizzaBoxConsolidator,
+        "application/x-hdf5;type=xia-xmap": HDF5Consolidator,
     },
 )
 
