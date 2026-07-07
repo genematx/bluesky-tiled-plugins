@@ -689,6 +689,36 @@ bytes_asset_testdata = [
 ]
 
 
+# Tuples of (uri, template, expected_uri).
+uri_join_testdata = [
+    # Directory URI + plain filename template.
+    (
+        "file://localhost/data/detector",
+        "/img_{:06d}.jpg",
+        "file://localhost/data/detector/img_000000.jpg",
+    ),
+    # Filename-prefix URI + suffix template (ophyd Registry style).
+    (
+        "file://localhost/data/detector/51ea13ff",
+        "_{:06d}.jpg",
+        "file://localhost/data/detector/51ea13ff_000000.jpg",
+    ),
+    # Both sides carry a `/` -- the degenerate `//` at the junction is
+    # collapsed to a single `/`.
+    (
+        "file://localhost/data/detector/",
+        "/img_{:06d}.jpg",
+        "file://localhost/data/detector/img_000000.jpg",
+    ),
+    # Non-`file://` scheme is treated identically -- no filesystem probing.
+    (
+        "https://example.invalid/data/detector/",
+        "/img_{:06d}.jpg",
+        "https://example.invalid/data/detector/img_000000.jpg",
+    ),
+]
+
+
 @pytest.mark.parametrize(
     "template, filename, expected_template, ranges, expected_suffixes",
     bytes_asset_testdata,
@@ -792,3 +822,24 @@ def test_bytes_factory_validate_and_mimetype_guard(
     sres["mimetype"] = "application/x-hdf5"
     with pytest.raises(ValueError, match="can not be handled by BytesConsolidator"):
         BytesConsolidator(sres, descriptor)
+
+
+@pytest.mark.parametrize("uri, template, expected_uri", uri_join_testdata)
+def test_get_datum_uri_join(
+    descriptor, image_seq_stream_resource_factory, uri, template, expected_uri
+):
+    """`get_datum_uri` concatenates URI and rendered template deterministically.
+
+    The join is purely syntactic (no filesystem probing) so it works for
+    remote URIs and for data that has not yet been flushed to disk. Both
+    conventions in the wild are preserved: filename-prefix URI + suffix
+    template, and directory URI + slash-prefixed filename template. A
+    single degenerate `//` at the junction is collapsed to `/`.
+    """
+    stream_resource = image_seq_stream_resource_factory(
+        image_format="jpeg", data_key="test_img", chunk_shape=(1,)
+    )
+    stream_resource["uri"] = uri
+    stream_resource["parameters"]["template"] = template
+    cons = consolidator_factory(stream_resource, descriptor)
+    assert cons.get_datum_uri(0) == expected_uri

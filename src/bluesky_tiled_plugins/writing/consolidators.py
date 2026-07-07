@@ -862,13 +862,23 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         Python formatting style that can be evaluated to a file name using the `.format(indx)` method given an
         integer index, e.g. "{:05d}.ext".
 
-        If template is not set, we assume that the uri is provided directly in the StreamResource document (i.e.
-        a single file case), and return it as is.
+        The URI and the rendered template are concatenated verbatim, so the caller controls whether a `/` separator
+        is present. Both conventions in the wild are supported: templates that render a bare filename appended
+        to a filename-prefix URI (e.g. `.../uid` + `_{:d}.tif`) and templates that carry their own leading `/`
+        appended to a directory URI (e.g. `.../dir` + `/{filename}.tif`).
+        A single degenerate `//` at the junction (both sides carrying a slash) is collapsed to `/`.
+
+        If template is not set, we assume that the uri is provided directly in the StreamResource document
+        (i.e. a single file case), and return it as is.
         """
 
-        if self.template:
-            return self.uri + self.template.format(indx - self._indx_offset)
-        return self.uri
+        if not self.template:
+            return self.uri
+
+        tail = self.template.format(indx - self._indx_offset)
+        if self.uri.endswith("/") and tail.startswith("/"):
+            tail = tail.lstrip("/")
+        return self.uri + tail
 
     def consume_stream_datum(self, doc: StreamDatum):
         """Determine the number and names of files from indices of datums and the number of files per datum.

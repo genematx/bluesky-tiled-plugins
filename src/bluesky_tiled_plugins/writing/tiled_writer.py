@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict, deque, namedtuple
 from collections.abc import Callable
 from dataclasses import asdict
-from pathlib import Path
+import posixpath
 import re
 from typing import Any, Optional, cast
 import warnings
@@ -42,7 +42,7 @@ from tiled.client.container import Container
 from tiled.client.dataframe import DataFrameClient
 from tiled.client.utils import handle_error, retry_context
 from tiled.structures.core import Spec
-from tiled.utils import safe_json_dump
+from tiled.utils import ensure_uri, safe_json_dump
 from packaging.version import Version
 
 from ..utils import truncate_json_overflow
@@ -281,12 +281,17 @@ class RunNormalizer(DocumentRouter):
             resource_spec = resource_dict.pop("spec")
             stream_resource_doc["mimetype"] = self.spec_to_mimetype[resource_spec]
             stream_resource_doc["parameters"] = resource_dict.pop("resource_kwargs", {})
-            file_path = Path(resource_dict.pop("root").strip("/")).joinpath(
-                resource_dict.pop("resource_path").strip("/")
-            )
-            stream_resource_doc["uri"] = "file://localhost/" + str(file_path).lstrip(
-                "/"
-            )
+
+            # Compose `root` and `resource_path` into a single path, then canonicalize as a URI.
+            # A trailing `/` on `resource_path` is meaningful -- it signals the directory-URI convention
+            # that the template will later append a filename to -- but `Path.absolute()` inside
+            # `ensure_uri` normalizes it away, so we preserve and reattach it explicitly.
+            resource_path = resource_dict.pop("resource_path", "")
+            if root := resource_dict.pop("root", None):
+                head = "/" if resource_path.startswith("/") else ""
+                resource_path = posixpath.join(root + head, resource_path.lstrip("/"))
+            tail = "/" if resource_path.endswith("/") else ""
+            stream_resource_doc["uri"] = ensure_uri(resource_path).rstrip("/") + tail
 
             # Keep the Bluesky spec name in parameters
             stream_resource_doc["parameters"]["spec"] = resource_spec
@@ -355,20 +360,22 @@ class RunNormalizer(DocumentRouter):
         # Some Datums contain datum_kwargs and the 'frame' field, which indicates the last index of the
         # frame. This should take precedence over the 'seq_num' field in the Event document. Keep the
         # last frame index in memory, since next Datums may refer to more than one frame (it is
-        # assumed that Events always refer to a single frame).
+        # assumed that Events always refer to a single frame). If `point_number` is provided in the
+        # datum_kwargs, use it as the index.
         # There are cases when the frame_index is reset during the scan (e.g. if Datums for the same
         # data_key belong to different Resources), so the 'carry' field is used to keep track of the
         # previous frame index.
         # In case when the index needs to RESET for each Resource, the `indices` dictionary should be
         # included in the datum_kwargs directly.
+
+        sres_uid = datum_doc["resource"]
         datum_kwargs = datum_doc.get("datum_kwargs", {})
-        frame = datum_kwargs.pop("frame", None)
         if indices := datum_kwargs.pop("indices", None):
             index_start, index_stop = indices["start"], indices["stop"]
-        elif frame is not None:
-            desc_name = self._desc_name_by_uid[
-                desc_uid
-            ]  # Name of the descriptor (stream)
+        elif (point_number := datum_kwargs.pop("point_number", None)) is not None:
+            index_start, index_stop = point_number, point_number + 1
+        elif (frame := datum_kwargs.pop("frame", None)) is not None:
+            desc_name = self._desc_name_by_uid[desc_uid]
             _next_index = self._next_frame_index[(desc_name, data_key)]
             index_start = sum(_next_index.values())
             _next_index["index"] = frame + 1
@@ -382,12 +389,12 @@ class RunNormalizer(DocumentRouter):
         indices = StreamRange(start=index_start, stop=index_stop)
         seq_nums = StreamRange(start=index_start + 1, stop=index_stop + 1)
 
-        # produce the Resource document, if needed (add data_key to match the StreamResource schema)
-        # Emit a copy of the StreamResource document with a new uid; this allows to account for cases
-        # where one Resource is used by several data streams with different data_keys and datum_kwargs.
+        # Produce the Resource document, if needed (add data_key to match the StreamResource schema)
+        # Emit a copy of the StreamResource document with a new uid scoped by
+        # (resource, descriptor, data_key) so multiple descriptors that reference the same Resource
+        # each get their own StreamResource and land on their own node in Tiled.
         sres_doc = None
-        sres_uid = datum_doc["resource"]
-        new_sres_uid = sres_uid + "-" + data_key
+        new_sres_uid = f"{sres_uid}-{desc_uid}-{data_key}"
         if (sres_uid in self._sres_cache) and (new_sres_uid not in self._emitted):
             sres_doc = copy.deepcopy(self._sres_cache[sres_uid])
             sres_doc["data_key"] = data_key
