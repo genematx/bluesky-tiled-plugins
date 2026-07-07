@@ -1,6 +1,5 @@
 import logging
 import re
-import time
 import copy
 import collections
 from dataclasses import asdict
@@ -140,8 +139,6 @@ def validate(
                     elif raise_on_error:
                         raise e
 
-            time.sleep(0.1)
-
     if try_reading and (not errored_keys):
         logger.info("Reading validation completed successfully.")
 
@@ -150,9 +147,10 @@ def validate(
         logger.warning(msg)
     if notes and write_notes:
         existing_notes = root_client.metadata.get("notes", [])
-        root_client.update_metadata(
-            {"notes": existing_notes + notes}, drop_revision=True
-        )
+        # Preserve order, drop duplicates so repeat validation is idempotent.
+        merged_notes = list(dict.fromkeys(existing_notes + notes))
+        if merged_notes != existing_notes:
+            root_client.update_metadata({"notes": merged_notes}, drop_revision=True)
 
     return not errored_keys
 
@@ -286,7 +284,11 @@ def validate_data_source(
             ast.size = size_from_uri(ast.data_uri)
         except (FileNotFoundError, OSError, ValueError) as e:
             raise AssetValidationException(
+<<<<<<< HEAD
                 f"Could not determine size of asset {ast.data_uri}: {e}"
+=======
+                f"Could not determine size of asset {ast.data_uri}: {type(e).__name__}: {e}"
+>>>>>>> main
             ) from e
 
     # If this is a data source with BytesStructure, we cannot validate it further

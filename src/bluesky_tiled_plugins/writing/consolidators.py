@@ -141,7 +141,7 @@ class ConsolidatorBase:
                 )
             ]
         self._sres_parameters = stream_resource["parameters"]
-        self._indx_offset = 0  # To reset file index for each new StreamResource
+        self._indx_offset = 0  # To reset file index counter for each new StreamResource
 
         # Any metadata to be set on the corresponding node in Tiled
         self.metadata: dict = {}
@@ -492,7 +492,12 @@ class ConsolidatorBase:
             warnings.warn(msg, stacklevel=2)
             notes.append(msg)
 
-        assert self.init_adapter() is not None, "Adapter can not be initialized"
+        try:
+            adapter = self.init_adapter()
+        except Exception as e:
+            raise RuntimeError(f"Adapter can not be initialized: {e}") from e
+        if adapter is None:
+            raise RuntimeError("Adapter can not be initialized")
 
         return notes
 
@@ -549,13 +554,25 @@ class BytesConsolidator:
         Python formatting style that can be evaluated to a file name using the `.format(indx)` method given an
         integer index, e.g. "{:05d}.ext".
 
+        The URI and the rendered template are concatenated verbatim, so
+        the caller controls whether a `/` separator is present. Both
+        conventions in the wild are supported: templates that render a
+        bare filename appended to a filename-prefix URI (e.g. `.../uid`
+        + `_{:d}.bin`) and templates that carry their own leading `/`
+        appended to a directory URI (e.g. `.../dir` + `/{filename}.bin`).
+        A single degenerate `//` at the junction (both sides carrying a
+        slash) is collapsed to `/`.
+
         If template is not set, we assume that the uri is provided directly in the StreamResource document (i.e.
         a single file case), and return it as is.
         """
 
-        if self.template:
-            return self.uri + self.template.format(indx - self._indx_offset)
-        return self.uri
+        if not self.template:
+            return self.uri
+        tail = self.template.format(indx - self._indx_offset)
+        if self.uri.endswith("/") and tail.startswith("/"):
+            tail = tail.lstrip("/")
+        return self.uri + tail
 
     def consume_stream_datum(self, doc: StreamDatum):
         """Register one Asset per file index in the incoming StreamDatum."""
@@ -582,7 +599,7 @@ class BytesConsolidator:
             filename = self._sres_parameters.get("filename", "")
             self.template = compile_template(template, filename)
 
-        # Reset the file index counter to start from "0" for the new StreamResource template
+        # Increment the offset to reset the file index counter to start from "0" for the new StreamResource template
         self._indx_offset = len(self.assets)
 
     def validate(self, fix_errors: bool = False) -> list[str]:
@@ -594,7 +611,7 @@ class BytesConsolidator:
                 size_from_uri(ast.data_uri)
             except (FileNotFoundError, OSError, ValueError) as e:
                 raise AssetValidationException(
-                    f"Could not determine size of asset {ast.data_uri}: {e}"
+                    f"Could not determine size of asset {ast.data_uri}: {type(e).__name__}: {e}"
                 ) from e
         return []
 
@@ -914,7 +931,7 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
             self._sres_parameters["template"], self._sres_parameters.get("filename", "")
         )
         self._recompute_files_per_datum()
-        # Reset the file index counter to start from "0" for the new StreamResource template
+        # Increment the offset to reset the file index counter to start from "0" for the new StreamResource template
         self._indx_offset = len(self.assets)
 
 
