@@ -238,7 +238,7 @@ class RunNormalizer(DocumentRouter):
         self.dispatcher = Dispatcher()
         self.patches = patches or {}
         self.spec_to_mimetype = defaultdict(
-            lambda: "application/octet-stream",
+            lambda: "application/unknown",
             {**MIMETYPE_LOOKUP, **(spec_to_mimetype or {})},
         )
 
@@ -493,9 +493,9 @@ class RunNormalizer(DocumentRouter):
             ):
                 data_keys_spec["dtype_numpy"] = dtype_numpy
 
-            # Ensure that shape is not None; otherwise, set it to an empty tuple
-            if "shape" in data_keys_spec and data_keys_spec.get("shape") is None:
-                data_keys_spec["shape"] = ()
+            # Ensure that shape is not None; otherwise, set it to an empty list. Convert to int.
+            if "shape" in data_keys_spec:
+                data_keys_spec["shape"] = list(map(int, data_keys_spec.get("shape") or []))
 
         # Ensure that all event data_keys have object_name assigned, if known (for consistency)
         # If "object_keys" are not present, do not reconstruct them -- they are optional

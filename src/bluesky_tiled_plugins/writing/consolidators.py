@@ -569,7 +569,10 @@ class BytesConsolidator:
 
         if not self.template:
             return self.uri
-        tail = self.template.format(indx - self._indx_offset)
+
+        # The index might have been already reset in datum_kwargs
+        indx_resetted = indx - self._indx_offset
+        tail = self.template.format(indx if indx_resetted < 0 else indx_resetted)
         if self.uri.endswith("/") and tail.startswith("/"):
             tail = tail.lstrip("/")
         return self.uri + tail
@@ -594,6 +597,7 @@ class BytesConsolidator:
     def update_from_stream_resource(self, stream_resource: StreamResource):
         "Update the consolidator with a new StreamResource document"
 
+        self.uri = stream_resource["uri"]
         self._sres_parameters = stream_resource["parameters"]
         if template := self._sres_parameters.get("template"):
             filename = self._sres_parameters.get("filename", "")
@@ -892,7 +896,9 @@ class MultipartRelatedConsolidator(ConsolidatorBase):
         if not self.template:
             return self.uri
 
-        tail = self.template.format(indx - self._indx_offset)
+        # The index might have been already reset in datum_kwargs
+        indx_resetted = indx - self._indx_offset
+        tail = self.template.format(indx if indx_resetted < 0 else indx_resetted)
         if self.uri.endswith("/") and tail.startswith("/"):
             tail = tail.lstrip("/")
         return self.uri + tail
