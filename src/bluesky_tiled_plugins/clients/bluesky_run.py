@@ -540,7 +540,7 @@ class BlueskyRunV3(_BlueskyRunSQL):
             # the data structure locally by the client itself (requires multiple
             # round-trips to the server, but better than nothing).
 
-            if response.status_code in {httpx.codes.NOT_FOUND, httpx.codes.INTERNAL_SERVER_ERROR}:
+            if response.status_code == httpx.codes.NOT_FOUND:
                 warnings.warn(
                     f"Tiled server encountered an error during validation: {response.status_code}. "
                     "Attempting to validate the data structure by the client.",
