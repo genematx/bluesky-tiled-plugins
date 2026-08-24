@@ -14,7 +14,6 @@ from tiled.structures.bytes import BytesStructure
 from tiled.structures.core import StructureFamily
 from tiled.structures.data_source import Asset, DataSource, Management
 from tiled.utils import OneShotCachedMap, path_from_uri
-from ..utils import compile_template, list_summands
 from ..utils import compile_template, list_summands, size_from_uri
 
 # User-provided adapters take precedence over defaults.

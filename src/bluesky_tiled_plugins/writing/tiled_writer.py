@@ -494,8 +494,10 @@ class RunNormalizer(DocumentRouter):
                 data_keys_spec["dtype_numpy"] = dtype_numpy
 
             # Ensure that shape is not None; otherwise, set it to an empty list. Convert to int.
-            if "shape" in data_keys_spec:
-                data_keys_spec["shape"] = list(map(int, data_keys_spec.get("shape") or []))
+            if shape := data_keys_spec.get("shape", None):
+                data_keys_spec["shape"] = [int(s) if s is not None else None for s in shape]
+            else:
+                data_keys_spec["shape"] = []
 
         # Ensure that all event data_keys have object_name assigned, if known (for consistency)
         # If "object_keys" are not present, do not reconstruct them -- they are optional
