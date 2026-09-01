@@ -850,7 +850,10 @@ class _RunWriter(DocumentRouter):
 
         suffix_and_tables = [("", table)]
         if table.num_columns > MAX_TABLE_COLUMNS:
-            suffix_and_tables = [(f"_{i}", tab) for i, tab in enumerate(split_table(table, MAX_TABLE_COLUMNS))]
+            suffix_and_tables = [
+                (f"_{i}", tab)
+                for i, tab in enumerate(split_table(table, MAX_TABLE_COLUMNS))
+            ]
 
         for suffix, table in suffix_and_tables:
             if not (df_client := self._internal_tables.get(f"{desc_name}{suffix}")):

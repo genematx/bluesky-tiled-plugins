@@ -1,4 +1,5 @@
 import collections.abc
+import math
 import re
 from urllib.parse import urlparse
 from tiled.utils import path_from_uri
@@ -9,6 +10,7 @@ __all__ = [
     "truncate_json_overflow",
     "compile_template",
     "list_summands",
+    "split_table",
 ]
 
 # If only tiled['client'] is installed we can not use the `size_from_uri` utility
@@ -129,4 +131,4 @@ def split_table(table, max_columns):
     part_size = math.ceil(ncols / math.ceil(ncols / max_columns))
 
     for i in range(0, ncols, part_size):
-        yield table.select(columns[i:i + part_size])
+        yield table.select(columns[i : i + part_size])
