@@ -475,7 +475,7 @@ class RunNormalizer(DocumentRouter):
         # Rename some fields (in-place) to match the current schema for the descriptor
         # Loop over all dictionaries that specify data_keys (both event data_keys or configuration data_keys)
         conf_data_keys = (
-            obj["data_keys"].values() for obj in doc.get("configuration", {}).values()
+            obj.get("data_keys", {}).values() for obj in doc.get("configuration", {}).values()
         )
         for data_keys_spec in itertools.chain(
             doc["data_keys"].values(), *conf_data_keys
