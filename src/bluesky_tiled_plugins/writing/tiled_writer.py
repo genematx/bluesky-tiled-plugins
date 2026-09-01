@@ -726,21 +726,20 @@ class _RunWriter(DocumentRouter):
                 self.notes.append(msg)
 
             # Create a new "internal" array data node or update the existing one
+            # Let numpy infer the dtype itself, if it is object type
             if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):                    
                 metadata = truncate_json_overflow(self.data_keys.get(key, {}))
+                dtype = metadata.get("dtype_numpy", None)
+                dtype = None if numpy.dtype(dtype).kind == "O" else dtype
                 try:
-                    array = numpy.array(
-                        arr_lst, dtype=metadata.get("dtype_numpy", None)
-                    )
+                    array = numpy.array(arr_lst, dtype=dtype)
                 except ValueError as e:
                     logger.error(
                         f"Error creating numpy array for key '{key}' in stream '{desc_name}': {e}."
                     )
                     array = numpy.array(arr_lst)
-                    metadata["dtype_numpy"] = str(array.dtype)
-                    logger.warning(
-                        f"Falling back to default dtype '{metadata['dtype_numpy']}'"
-                    )
+                    logger.warning(f"Falling back to default dtype '{array.dtype}'")
+                metadata["dtype_numpy"] = str(array.dtype)
 
                 arr_client = desc_node.write_array(
                     array,
@@ -1029,7 +1028,7 @@ class _RunWriter(DocumentRouter):
                         self._int_ragged_array_keys[desc_name].add(key)
                     elif 0 <= self._max_array_size < math.prod(val.get("shape", ())):
                         self._int_array_keys[desc_name].add(key)
-                    elif numpy.dtype(val.get("dtype_numpy")) in {"U", "S"}:
+                    elif numpy.dtype(val.get("dtype_numpy")) in {"U", "S", "O"}:
                         self._int_array_keys[desc_name].add(key)
         else:
             # Rare Case: This new descriptor likely updates stream configs mid-experiment
