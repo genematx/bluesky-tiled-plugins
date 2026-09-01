@@ -46,7 +46,7 @@ from tiled.structures.core import Spec
 from tiled.utils import ensure_uri, safe_json_dump
 from packaging.version import Version
 
-from ..utils import truncate_json_overflow
+from ..utils import truncate_json_overflow, split_table
 from ._dispatcher import Dispatcher
 from ._json_writer import JSONLinesWriter, JSONDictWriter
 from .validator import ValidationException
@@ -65,6 +65,9 @@ BATCH_SIZE = 10000
 # as zarr. Set to 0 to write all internal arrays as zarr, and -1 to write all internal arrays to tabular storage.
 MAX_ARRAY_SIZE = 16
 
+# Maximum number of columns in a single table; larger tables will be split into multiple tables
+MAX_TABLE_COLUMNS = 1024
+
 # Disallow using reserved words as data_keys identifiers
 # Related: https://github.com/bluesky/event-model/pull/223
 RESERVED_DATA_KEYS = ["time", "seq_num"]
@@ -80,7 +83,7 @@ JSON_TO_NUMPY_DTYPE = {
 
 # A lookup table for converting Bluesky spec names to MIME types
 MIMETYPE_LOOKUP = defaultdict(
-    lambda: "application/octet-stream",
+    lambda: "application/unknown",
     {
         "HDF5": "application/x-hdf5",
         "AD_HDF5": "application/x-hdf5",
@@ -238,7 +241,7 @@ class RunNormalizer(DocumentRouter):
         self.dispatcher = Dispatcher()
         self.patches = patches or {}
         self.spec_to_mimetype = defaultdict(
-            lambda: "application/octet-stream",
+            lambda: "application/unknown",
             {**MIMETYPE_LOOKUP, **(spec_to_mimetype or {})},
         )
 
@@ -472,7 +475,7 @@ class RunNormalizer(DocumentRouter):
         # Rename some fields (in-place) to match the current schema for the descriptor
         # Loop over all dictionaries that specify data_keys (both event data_keys or configuration data_keys)
         conf_data_keys = (
-            obj["data_keys"].values() for obj in doc.get("configuration", {}).values()
+            obj.get("data_keys", {}).values() for obj in doc.get("configuration", {}).values()
         )
         for data_keys_spec in itertools.chain(
             doc["data_keys"].values(), *conf_data_keys
@@ -493,9 +496,11 @@ class RunNormalizer(DocumentRouter):
             ):
                 data_keys_spec["dtype_numpy"] = dtype_numpy
 
-            # Ensure that shape is not None; otherwise, set it to an empty tuple
-            if "shape" in data_keys_spec and data_keys_spec.get("shape") is None:
-                data_keys_spec["shape"] = ()
+            # Ensure that shape is not None; otherwise, set it to an empty list. Convert to int.
+            if shape := data_keys_spec.get("shape", None):
+                data_keys_spec["shape"] = [int(s) if s is not None else None for s in shape]
+            else:
+                data_keys_spec["shape"] = []
 
         # Ensure that all event data_keys have object_name assigned, if known (for consistency)
         # If "object_keys" are not present, do not reconstruct them -- they are optional
@@ -688,6 +693,9 @@ class _RunWriter(DocumentRouter):
         self._int_array_keys: dict[str, set[str]] = defaultdict(set)
         # data_keys with array data of inconsistent length, by desc_name
         self._int_ragged_array_keys: dict[str, set[str]] = defaultdict(set)
+        # Mapping of dimension size -> shared dimension name for internal arrays,
+        # by desc_name, so equal-sized dimensions align in the xarray Dataset.
+        self._int_dims_names: dict[str, dict[int, str]] = defaultdict(dict)
         self._batch_size: int = batch_size
         self._max_array_size: int = max_array_size  # Max array size in SQL
         self._validate: bool = validate
@@ -695,6 +703,32 @@ class _RunWriter(DocumentRouter):
         self.data_keys: dict[str, DataKey] = {}
         self.access_tags: list[str] | None = None
         self.notes: list[str] = []
+
+    def _internal_dims(
+        self, desc_name: str, shape: tuple[int | None, ...]
+    ) -> tuple[str, ...]:
+        """Return dimension names for an internal array.
+
+        The leading (event) dimension is always `time`. Each subsequent
+        dimension of a known size is named after that size, reusing a name for
+        every recurrence of the size across all internal arrays in the stream,
+        so equal-sized dimensions align in the xarray Dataset while different
+        sizes stay distinct; these use a `dim_int_{i}` prefix. A dimension of
+        unknown size (`None`, i.e. a ragged/variable-length dimension) can not
+        be shared and is named `dim_rgd_{axis}` per array by its axis position.
+        Both prefixes distinguish internal dimensions from external (regular)
+        dimension names.
+        """
+        names = self._int_dims_names[desc_name]
+        dims = ["time"]
+        for axis, size in enumerate(shape[1:], start=1):
+            if size is None:
+                dims.append(f"dim_rgd_{axis}")
+                continue
+            if size not in names:
+                names[size] = f"dim_int_{len(names) + 1}"
+            dims.append(names[size])
+        return tuple(dims)
 
     def _write_internal_data(
         self, data_cache: list[dict[str, Any]], desc_node: Container
@@ -704,7 +738,11 @@ class _RunWriter(DocumentRouter):
         desc_name = desc_node.item["id"]  # Name of the descriptor (stream)
         # 1. Write internal array data, if any; remove it from the tabular data
         for key in self._int_array_keys[desc_name]:
-            arr_lst = [row.pop(key) for row in data_cache if key in row]
+            arr_lst = [row[key] for row in data_cache if key in row]
+            if not arr_lst:
+                # No data received for this key in the current batch (e.g. it was
+                # supplied out-of-band as an external stream resource); nothing to write.
+                continue
 
             # Pad the arrays with NaNs to make them the same length if necessary
             min_len, max_len = (
@@ -720,28 +758,53 @@ class _RunWriter(DocumentRouter):
                 logger.warning(msg)
                 self.notes.append(msg)
 
-            # Create a new "internal" array data node or update the existing one
-            if not (arr_client := self._internal_arrays.get(f"{desc_name}/{key}")):
-                metadata = truncate_json_overflow(self.data_keys.get(key, {}))
-                try:
-                    array = numpy.array(
-                        arr_lst, dtype=metadata.get("dtype_numpy", None)
-                    )
-                except ValueError as e:
-                    logger.error(
-                        f"Error creating numpy array for key '{key}' in stream '{desc_name}': {e}."
-                    )
-                    array = numpy.array(arr_lst)
-                    metadata["dtype_numpy"] = str(array.dtype)
-                    logger.warning(
-                        f"Falling back to default dtype '{metadata['dtype_numpy']}'"
-                    )
+            # Build the numpy array for this batch. For an existing node reuse its
+            # dtype; otherwise take the declared dtype, letting numpy infer it
+            # (e.g. a fixed-width string dtype) when the declared dtype is `Object`.
+            arr_client = self._internal_arrays.get(f"{desc_name}/{key}")
+            metadata = truncate_json_overflow(self.data_keys.get(key, {}))
+            dtype = (
+                arr_client.dtype
+                if arr_client is not None
+                else (metadata.get("dtype_numpy") or None)
+            )
+            if dtype is not None and numpy.dtype(dtype).kind == "O":
+                dtype = None
+            try:
+                array = numpy.array(arr_lst, dtype=dtype)
+            except ValueError as e:
+                logger.error(
+                    f"Error creating numpy array for key '{key}' in stream '{desc_name}': {e}."
+                )
+                array = numpy.array(arr_lst)
+                logger.warning(f"Falling back to default dtype '{array.dtype}'")
 
+            # A zero-length dimension can not be stored as a zarr array because
+            # zarr can not chunk a zero-length dimension. Rather than fail the write
+            # for the whole run, leave the values in the tabular data so they are
+            # stored in the SQL table with their original dtype.
+            if 0 in array.shape:
+                msg = (
+                    f"Internal array data for key '{key}' in stream '{desc_name}' has a "
+                    f"zero-length dimension (shape {array.shape}) and can not be stored "
+                    f"as a zarr array; it is stored in the internal table instead."
+                )
+                logger.warning(msg)
+                self.notes.append(msg)
+                continue
+
+            # The array is written as a zarr node, so remove it from the tabular data.
+            for row in data_cache:
+                row.pop(key, None)
+
+            # Create a new "internal" array data node or update the existing one
+            if arr_client is None:
+                metadata["dtype_numpy"] = str(array.dtype)
                 arr_client = desc_node.write_array(
                     array,
                     key=key,
                     metadata=metadata,
-                    dims=("time", "dim_1"),  # Always 2D
+                    dims=self._internal_dims(desc_name, array.shape),
                     access_tags=self.access_tags,
                 )
 
@@ -751,7 +814,7 @@ class _RunWriter(DocumentRouter):
                 )
             else:
                 arr_client.patch(
-                    numpy.array(arr_lst, dtype=arr_client.dtype),
+                    array,
                     offset=arr_client.shape[:1],
                     extend=True,
                 )
@@ -771,7 +834,7 @@ class _RunWriter(DocumentRouter):
                     array,
                     key=key,
                     metadata=metadata,
-                    dims=("time", *[f"dim_{i}" for i in range(1, len(shape))]),
+                    dims=self._internal_dims(desc_name, shape),
                     access_tags=self.access_tags,
                 )
                 self._internal_arrays[f"{desc_name}/{key}"] = arr_client
@@ -785,33 +848,41 @@ class _RunWriter(DocumentRouter):
         if not (table := pyarrow.Table.from_pylist(data_cache)):
             return  # Nothing to write
 
-        if not (df_client := self._internal_tables.get(desc_name)):
-            # Create a new "internal" data node and write the initial piece of data
-            metadata = {
-                k: v for k, v in self.data_keys.items() if k in table.column_names
-            }
-            metadata = truncate_json_overflow(metadata)
-            # Replace any nulls in the schema with string type
-            schema = copy.copy(table.schema)
-            for i, field in enumerate(table.schema):
-                if pyarrow.types.is_null(field.type):
-                    schema = schema.set(i, field.with_type(pyarrow.string()))
-                elif pyarrow.types.is_list(field.type) and pyarrow.types.is_null(
-                    field.type.value_type
-                ):
-                    schema = schema.set(
-                        i, field.with_type(pyarrow.list_(pyarrow.string()))
-                    )
-            # Initialize the table and keep a reference to the client
-            df_client = desc_node.create_appendable_table(
-                schema=schema,
-                key="internal",
-                metadata=metadata,
-                access_tags=self.access_tags,
-            )
-            self._internal_tables[desc_name] = df_client
+        suffix_and_tables = [("", table)]
+        if table.num_columns > MAX_TABLE_COLUMNS:
+            suffix_and_tables = [
+                (f"_{i}", tab)
+                for i, tab in enumerate(split_table(table, MAX_TABLE_COLUMNS))
+            ]
 
-        df_client.append_partition(0, table)
+        for suffix, table in suffix_and_tables:
+            if not (df_client := self._internal_tables.get(f"{desc_name}{suffix}")):
+                # Create a new "internal" data node and write the initial piece of data
+                metadata = {
+                    k: v for k, v in self.data_keys.items() if k in table.column_names
+                }
+                metadata = truncate_json_overflow(metadata)
+                # Replace any nulls in the schema with string type
+                schema = copy.copy(table.schema)
+                for i, field in enumerate(table.schema):
+                    if pyarrow.types.is_null(field.type):
+                        schema = schema.set(i, field.with_type(pyarrow.string()))
+                    elif pyarrow.types.is_list(field.type) and pyarrow.types.is_null(
+                        field.type.value_type
+                    ):
+                        schema = schema.set(
+                            i, field.with_type(pyarrow.list_(pyarrow.string()))
+                        )
+                # Initialize the table and keep a reference to the client
+                df_client = desc_node.create_appendable_table(
+                    schema=schema,
+                    key=f"internal{suffix}",
+                    metadata=metadata,
+                    access_tags=self.access_tags,
+                )
+                self._internal_tables[f"{desc_name}{suffix}"] = df_client
+
+            df_client.append_partition(0, table)
 
     def _update_consolidator(self, doc: StreamDatum):
         """Register the external data from StreamDatum in the Consolidator"""
@@ -942,7 +1013,7 @@ class _RunWriter(DocumentRouter):
                     # it will return 404 Not Found error; in this case, attempt to validate
                     # the data structure locally with the Consolidator.
 
-                    if response.status_code == httpx.codes.NOT_FOUND:
+                    if response.status_code in (httpx.codes.NOT_FOUND, httpx.codes.UNAUTHORIZED):
                         warnings.warn(
                             "Tiled server does not support remote validation. "
                             "Attempting to validate the data structure locally."
@@ -1018,6 +1089,12 @@ class _RunWriter(DocumentRouter):
                     if None in val.get("shape", ()):
                         self._int_ragged_array_keys[desc_name].add(key)
                     elif 0 <= self._max_array_size < math.prod(val.get("shape", ())):
+                        self._int_array_keys[desc_name].add(key)
+                    elif (dtype_numpy := val.get("dtype_numpy")) and numpy.dtype(
+                        dtype_numpy
+                    ).kind in {"U", "S", "O"}:
+                        # String/bytes/object arrays can not be stored in SQL in a
+                        # readable form, so always write them as zarr arrays.
                         self._int_array_keys[desc_name].add(key)
         else:
             # Rare Case: This new descriptor likely updates stream configs mid-experiment

@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from collections.abc import Iterator
 from typing import cast
 from urllib.parse import parse_qs, urlparse
@@ -804,23 +805,14 @@ def test_json_backup(client, tmpdir, monkeypatch):
 @pytest.mark.parametrize(
     "max_array_size, expected_scheme",
     [
-        pytest.param(
-            0,
-            "file",
-            marks=pytest.mark.xfail(
-                reason=(
-                    "internal_events.json has a data_key with a zero-length dimension; "
-                    "most zarr versions reject chunk edges of 0. Passes on zarr <3.2 "
-                    "and >=3.1; fails on zarr 2.x and zarr >=3.2."
-                ),
-                raises=(ZeroDivisionError, ValueError),
-                strict=False,
-            ),
-        ),
+        (0, "file"),
         (4, "file"),
         (16, "duckdb"),
         (-1, "duckdb"),
     ],
+)
+@pytest.mark.filterwarnings(
+    "ignore:Failed to convert ragged array to numpy:UserWarning"
 )
 def test_internal_arrays_written_as_zarr(client, max_array_size, expected_scheme):
     tw = TiledWriter(client, max_array_size=max_array_size)
@@ -843,6 +835,54 @@ def test_internal_arrays_written_as_zarr(client, max_array_size, expected_scheme
         urlparse(internal_table.data_sources()[0].assets[0].data_uri).scheme == "duckdb"
     )
 
+    # String arrays are always written as zarr, regardless of their size, because
+    # they can not be stored in the SQL table in a readable form.
+    str_arr = run["primary"]["str_arr"]
+    assert str_arr.shape == (3, 3)
+    assert str_arr.read()[0].tolist() == ["foo", "bar", "baz"]
+    assert "str_arr" not in internal_table.columns
+    assert urlparse(str_arr.data_sources()[0].assets[0].data_uri).scheme == "file"
+
+    # The "empty" data_key carries a zero-length array in every event. When
+    # classified as an internal (zarr) array (max_array_size == 0) it holds no
+    # data and can not be chunked by zarr, so it falls back to the tabular
+    # store instead of being written as a separate zarr node.
+    if max_array_size == 0:
+        assert "empty" not in run["primary"].base
+        assert "empty" in internal_table.columns
+
+    # An nD per-event array (2x3 strings) is stored as a 3D zarr array and read
+    # back with its full shape.
+    str_img = run["primary"]["str_img"]
+    assert str_img.shape == (3, 2, 3)
+    assert str_img.read()[0].tolist() == [["aa", "bb", "cc"], ["dd", "ee", "ff"]]
+    assert urlparse(str_img.data_sources()[0].assets[0].data_uri).scheme == "file"
+
+    # Internal dimension names: the event axis is always "time"; inner dims are
+    # named per size with a "dim_int_" prefix and shared across keys so
+    # equal-sized dimensions align in the xarray Dataset.
+    str_arr_dims = run["primary"].base["str_arr"].dims
+    str_img_dims = run["primary"].base["str_img"].dims
+    assert str_arr_dims[0] == str_img_dims[0] == "time"
+    assert all(d.startswith("dim_int_") for d in str_arr_dims[1:] + str_img_dims[1:])
+    # str_arr (size 3) and str_img's trailing axis (size 3) share a name; the
+    # two str_img axes (sizes 2 and 3) get distinct names.
+    assert str_img_dims[2] == str_arr_dims[1]
+    assert str_img_dims[1] != str_img_dims[2]
+
+    # Ragged arrays: the variable-length (None) axis is named "dim_rgd_{axis}"
+    # while a fixed-size axis reuses a shared "dim_int_" name.
+    ragged_dims = run["primary"].base["ragged"].dims
+    assert ragged_dims[0] == "time"
+    assert ragged_dims[-1] == "dim_rgd_2"
+    assert ragged_dims[1].startswith("dim_int_")
+
+    # Tabular columns share the same "time" event axis as the zarr arrays, so
+    # the assembled dataset has no stray "dim0".
+    dataset = run["primary"].read()
+    assert "time" in dataset.sizes
+    assert "dim0" not in dataset.sizes
+
     if expected_scheme == "file":
         assert (
             "long" in run["primary"].base
@@ -854,10 +894,103 @@ def test_internal_arrays_written_as_zarr(client, max_array_size, expected_scheme
             urlparse(run["primary"]["long"].data_sources()[0].assets[0].data_uri).scheme
             == "file"
         )
+        # The size-8 "long" axis gets a different name than the size-3 str_arr
+        # axis.
+        long_dims = run["primary"].base["long"].dims
+        assert long_dims[0] == "time"
+        assert long_dims[1].startswith("dim_int_")
+        assert long_dims[1] != str_arr_dims[1]
     else:
         assert "long" not in run["primary"].base
         assert "long" in internal_table.columns
         assert run["primary"]["long"].data_sources() is None
+
+
+def test_large_internal_table_split_into_multiple_nodes(client, monkeypatch):
+    """A stream whose internal table has more columns than `MAX_TABLE_COLUMNS`
+    is stored as several `internal_{i}` nodes, each holding a disjoint subset
+    of the columns; all columns remain readable through the stream.
+    """
+    from bluesky_tiled_plugins.writing import tiled_writer as tw_mod
+
+    monkeypatch.setattr(tw_mod, "MAX_TABLE_COLUMNS", 4)
+
+    ncols = 10
+    keys = [f"col_{i:03d}" for i in range(ncols)]
+    uid = uuid.uuid4().hex
+    desc_uid = uuid.uuid4().hex
+    docs = [
+        ("start", {"uid": uid, "time": 0.0}),
+        (
+            "descriptor",
+            {
+                "uid": desc_uid,
+                "run_start": uid,
+                "time": 0.0,
+                "name": "primary",
+                "data_keys": {
+                    k: {
+                        "source": "sim",
+                        "dtype": "number",
+                        "shape": [],
+                        "object_name": "det",
+                    }
+                    for k in keys
+                },
+                "object_keys": {"det": keys},
+            },
+        ),
+        (
+            "event",
+            {
+                "uid": uuid.uuid4().hex,
+                "descriptor": desc_uid,
+                "time": 0.0,
+                "seq_num": 1,
+                "data": {k: float(i) for i, k in enumerate(keys)},
+                "timestamps": {k: 0.0 for k in keys},
+                "filled": {},
+            },
+        ),
+        (
+            "stop",
+            {
+                "uid": uuid.uuid4().hex,
+                "run_start": uid,
+                "time": 1.0,
+                "exit_status": "success",
+                "num_events": {"primary": 1},
+            },
+        ),
+    ]
+
+    tw = TiledWriter(client)
+    for name, doc in docs:
+        tw(name=name, doc=doc)
+
+    run = client[uid]
+    base = run["primary"].base
+
+    # The internal table (data columns plus their `ts_` timestamps and
+    # `seq_num`/`time`) exceeds MAX_TABLE_COLUMNS and is split into a
+    # contiguously numbered set of `internal_{i}` nodes.
+    internal_nodes = sorted(k for k in base.keys() if k.startswith("internal"))
+    assert len(internal_nodes) > 1
+    assert internal_nodes == [f"internal_{i}" for i in range(len(internal_nodes))]
+
+    # Each part holds at most MAX_TABLE_COLUMNS columns, and every data key is
+    # stored in exactly one part.
+    for node_key in internal_nodes:
+        assert len(base[node_key].columns) <= 4
+    stored = [
+        c for node_key in internal_nodes for c in base[node_key].columns if c in keys
+    ]
+    assert sorted(stored) == keys
+
+    # All columns are still readable through the assembled stream.
+    dataset = run["primary"].read()
+    for i, k in enumerate(keys):
+        assert float(dataset[k].values[0]) == float(i)
 
 
 @pytest.mark.parametrize("corrupt_uri", [False, True])

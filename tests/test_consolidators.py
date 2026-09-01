@@ -835,6 +835,111 @@ uri_join_testdata = [
 ]
 
 
+@pytest.mark.parametrize(
+    "template, filename, expected_template, ranges, expected_suffixes",
+    bytes_asset_testdata,
+)
+def test_bytes_asset_generation(
+    descriptor,
+    bytes_stream_resource_factory,
+    template,
+    filename,
+    expected_template,
+    ranges,
+    expected_suffixes,
+):
+    """`BytesConsolidator` registers one Asset per file index, honoring the
+    (optional) filename template, and produces a `bytes` DataSource."""
+    sres = bytes_stream_resource_factory(
+        data_key="test_img", template=template, filename=filename
+    )
+    cons = BytesConsolidator(sres, descriptor)
+    assert cons.template == expected_template
+    assert cons.assets == []
+
+    for i, (start, stop) in enumerate(ranges):
+        patch = cons.consume_stream_datum({"indices": {"start": start, "stop": stop}})
+        assert patch == Patch(offset=(start,), shape=(stop - start,))
+
+    uris = [a.data_uri for a in cons.assets]
+    assert [u.split("/")[-1] for u in uris] == expected_suffixes
+    assert [a.num for a in cons.assets] == list(range(len(cons.assets)))
+    assert all(a.parameter == "data_uris" for a in cons.assets)
+    assert all(a.is_directory is False for a in cons.assets)
+
+    ds = cons.get_data_source()
+    assert ds.structure_family == StructureFamily.bytes
+    assert isinstance(ds.structure, BytesStructure)
+    assert ds.mimetype == "application/octet-stream"
+    assert ds.management == Management.external
+    assert ds.parameters == {} and ds.properties == {}
+    assert len(ds.assets) == len(expected_suffixes)
+
+
+def test_bytes_update_from_stream_resource_resets_index_offset(
+    descriptor, bytes_stream_resource_factory
+):
+    """A second StreamResource restarts the template index at 0 relative to
+    the new batch, so files land at the correct name."""
+    sres1 = bytes_stream_resource_factory(data_key="test_img", template="a_{:03d}.bin")
+    cons = BytesConsolidator(sres1, descriptor)
+    cons.consume_stream_datum({"indices": {"start": 0, "stop": 2}})
+    assert cons.assets[-1].data_uri.endswith("a_001.bin")
+
+    sres2 = bytes_stream_resource_factory(data_key="test_img", template="b_{:03d}.bin")
+    cons.update_from_stream_resource(sres2)
+    assert cons.template == "b_{:03d}.bin"
+    cons.consume_stream_datum({"indices": {"start": 2, "stop": 4}})
+    # Second batch starts at "0" for the new template, not at "2".
+    assert cons.assets[2].data_uri.endswith("b_000.bin")
+    assert cons.assets[3].data_uri.endswith("b_001.bin")
+
+
+@pytest.mark.parametrize(
+    "spec, expected_metadata",
+    [(None, {}), ("MY_SPEC", {"spec": "MY_SPEC"})],
+)
+@pytest.mark.parametrize(
+    "cons_cls, sres_factory_name, factory_kwargs",
+    [
+        (BytesConsolidator, "bytes_stream_resource_factory", {}),
+        (HDF5Consolidator, "hdf5_stream_resource_factory", {"chunk_shape": ()}),
+    ],
+    ids=["bytes", "hdf5"],
+)
+def test_spec_metadata_propagation(
+    request,
+    descriptor,
+    cons_cls,
+    sres_factory_name,
+    factory_kwargs,
+    spec,
+    expected_metadata,
+):
+    """The `spec` StreamResource parameter is propagated to consolidator metadata
+    the same way for `BytesConsolidator` and (any subclass of) `ConsolidatorBase`."""
+    sres_factory = request.getfixturevalue(sres_factory_name)
+    sres = sres_factory(data_key="test_img", spec=spec, **factory_kwargs)
+    cons = cons_cls(sres, descriptor)
+    assert cons.metadata == expected_metadata
+
+
+def test_bytes_factory_validate_and_mimetype_guard(
+    descriptor, bytes_stream_resource_factory
+):
+    """`consolidator_factory` dispatches to `BytesConsolidator`, `validate`
+    succeeds when assets are reachable, and an unsupported mimetype is rejected."""
+    sres = bytes_stream_resource_factory(data_key="test_img")
+    cons = consolidator_factory(sres, descriptor)
+    assert isinstance(cons, BytesConsolidator)
+    assert cons.validate() == []
+    assert cons.validate(fix_errors=True) == []
+
+    sres["mimetype"] = "application/x-hdf5"
+    with pytest.raises(ValueError, match="can not be handled by BytesConsolidator"):
+        BytesConsolidator(sres, descriptor)
+
+
 @pytest.mark.parametrize("uri, template, expected_uri", uri_join_testdata)
 def test_get_datum_uri_join(
     descriptor, image_seq_stream_resource_factory, uri, template, expected_uri
