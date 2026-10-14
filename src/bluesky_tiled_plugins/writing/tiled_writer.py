@@ -6,7 +6,6 @@ from collections import defaultdict, deque, namedtuple
 from collections.abc import Callable
 from dataclasses import asdict
 import posixpath
-import re
 from typing import Any, Optional, cast
 import warnings
 
@@ -49,7 +48,6 @@ from packaging.version import Version
 from ..utils import truncate_json_overflow, split_table
 from ._dispatcher import Dispatcher
 from ._json_writer import JSONLinesWriter, JSONDictWriter
-from .validator import ValidationException
 from .consolidators import (
     ConsolidatorBase,
     DataSource,
@@ -165,11 +163,16 @@ ExternalEventDataReference = namedtuple(
 class _ConditionalBackup:
     """Callback to save Bluesky data if the primary callback fails.
 
-    Callback that tries to call the primary callback and,
-    if it fails, flushes the buffer to backup callbacks.
+    Callback that tries to call the primary callback and, if it fails, flushes
+    the buffer to backup callbacks.
 
-    Once an error has been encountererd in the primary callback,
-    all subsequent documents would be sent to the backup callbacks as well.
+    Once an error has been encountered in the primary callback, the primary
+    callback is *abandoned* for the remainder of the run: all documents
+    (including the buffered ones already seen) are sent to the backup callbacks
+    only. This guarantees that a failed run never receives further writes --
+    in particular the Stop document -- from the primary, so a partially
+    written run can not masquerade as a complete one; the full document
+    stream is preserved in the backups for later replay.
 
     This callback is intended to be used with a `RunRouter` and process
     documents from a single Bluesky run.
@@ -184,30 +187,32 @@ class _ConditionalBackup:
         self.primary_callback = primary_callback
         self.backup_callbacks = backup_callbacks
         self._buffer: deque[tuple[str, DocumentType]] = deque(maxlen=maxlen)
-        self._push_to_backup = False
+        self._primary_failed = False
 
     def __call__(self, name: str, doc: DocumentType):
         self._buffer.append((name, doc))
 
-        try:
-            self.primary_callback(name, doc)
-        except Exception as e:
-            logger.warning(
-                f"Primary callback {type(self.primary_callback).__name__} failed: {e}. "
-                "Flushing buffer to backup callbacks.",
-                stacklevel=2,
-            )
-            self._push_to_backup = True
+        if not self._primary_failed:
+            try:
+                self.primary_callback(name, doc)
+            except Exception:
+                logger.exception(
+                    f"Primary callback {type(self.primary_callback).__name__} failed "
+                    f"while processing a {name!r} document. No further documents from "
+                    "this run will be sent to the primary callback; the full run is "
+                    "routed to the backup callbacks instead."
+                )
+                self._primary_failed = True
 
-        if self._push_to_backup:
-            for name, doc in self._buffer:
+        if self._primary_failed:
+            for buffered_name, buffered_doc in self._buffer:
                 for bcb in self.backup_callbacks:
                     try:
-                        bcb(name, doc)
-                    except Exception as e:
-                        logger.warning(
-                            f"Backup callback {bcb.__class__.__name__} failed with error: {e}",
-                            stacklevel=2,
+                        bcb(buffered_name, buffered_doc)
+                    except Exception:
+                        logger.exception(
+                            f"Backup callback {bcb.__class__.__name__} failed "
+                            f"while processing a {buffered_name!r} document."
                         )
             self._buffer.clear()
 
@@ -821,7 +826,14 @@ class _RunWriter(DocumentRouter):
 
         # 2. Write internal ragged array data, if any; remove it from the tabular data
         for key in self._int_ragged_array_keys[desc_name]:
-            from tiled.structures.ragged import make_ragged_array
+            try:
+                from tiled.structures.ragged import make_ragged_array
+            except ImportError as err:
+                raise ImportError(
+                    "Writing ragged (variable-length) array data requires optional "
+                    "dependencies. Install them with: "
+                    "pip install bluesky-tiled-plugins[ragged]"
+                ) from err
 
             arr_lst = [row.pop(key) for row in data_cache if key in row]
             shape = (len(arr_lst), *self.data_keys[key].get("shape", ()))
@@ -882,7 +894,48 @@ class _RunWriter(DocumentRouter):
                 )
                 self._internal_tables[f"{desc_name}{suffix}"] = df_client
 
+            self._append_with_retry(df_client, table, desc_name)
+
+    def _append_with_retry(self, df_client: DataFrameClient, table, desc_name: str):
+        """Append rows to the internal table, retrying on transient errors.
+
+        The Tiled client deliberately does not retry an append whose request may
+        have already been processed by the server (e.g. the response was lost to
+        a read timeout), because a retry can duplicate the appended rows. For
+        Bluesky event data we accept that trade-off rather than failing the run.
+        Such a retry is forced here, with a warning and a note recorded in the run
+        metadata so that possibly duplicated rows can be identified later.
+
+        Client errors (4xx) are not retried -- they would fail again."""
+        try:
             df_client.append_partition(0, table)
+            return
+        except (httpx.TransportError, httpx.HTTPStatusError) as err:
+            if (
+                isinstance(err, httpx.HTTPStatusError)
+                and err.response.status_code < 500
+                and err.response.status_code != 429
+            ):
+                raise  # A client error (4xx); retrying would not help.
+            min_seq_num, max_seq_num = pyarrow.compute.min_max(
+                table["seq_num"]
+            ).values()
+            if min_seq_num == max_seq_num:
+                msg = f"Affected 'seq_num': {min_seq_num}."
+            else:
+                msg = f"Affected 'seq_num' range: {min_seq_num} - {max_seq_num}."
+            msg = (
+                f"Appending {table.num_rows} rows to the internal table of stream "
+                f"'{desc_name}' failed with {err!r}; forcing a retry. If the failed "
+                "attempt was in fact processed by the server, the rows may be duplicated."
+                f" {msg}"
+            )
+            logger.warning(msg)
+            self.notes.append(msg)
+
+        for attempt in retry_context():
+            with attempt:
+                df_client.append_partition(0, table)
 
     def _update_consolidator(self, doc: StreamDatum):
         """Register the external data from StreamDatum in the Consolidator"""
@@ -909,17 +962,18 @@ class _RunWriter(DocumentRouter):
 
         for attempt in retry_context():
             with attempt:
-                response = node.context.http_client.put(
-                    node.uri.replace("/metadata/", "/data_source/", 1),
-                    content=safe_json_dump({"data_source": data_source}),
-                    params={
-                        "patch_shape": ",".join(map(str, patch.shape)),
-                        "patch_offset": ",".join(map(str, patch.offset)),
-                    }
-                    if patch
-                    else None,
+                handle_error(
+                    node.context.http_client.put(
+                        node.uri.replace("/metadata/", "/data_source/", 1),
+                        content=safe_json_dump({"data_source": data_source}),
+                        params={
+                            "patch_shape": ",".join(map(str, patch.shape)),
+                            "patch_offset": ",".join(map(str, patch.offset)),
+                        }
+                        if patch
+                        else None,
+                    )
                 )
-        handle_error(response)
 
     def _write_external_data(self, doc: StreamDatum):
         """Register (or update) the external data from StreamDatum in Tiled"""
@@ -932,12 +986,41 @@ class _RunWriter(DocumentRouter):
     def start(self, doc: RunStart):
         doc = copy.copy(doc)
         self.access_tags = doc.pop("tiled_access_tags", None)  # type: ignore
+        extra_specs = doc.pop("tiled_specs", None) or []
         self.root_node = self.client.create_container(
             key=doc["uid"],
             metadata={"start": truncate_json_overflow(dict(doc))},
-            specs=[Spec("BlueskyRun", version="3.0")],
+            specs=[
+                *(Spec(s) if isinstance(s, str) else Spec(**s) for s in extra_specs),
+                Spec("BlueskyRun", version="3.0"),
+            ],
             access_tags=self.access_tags,
         )
+
+    def _close_stream_tree(self) -> None:
+        if self.root_node is None:
+            return
+
+        seen_uris: set[str] = set()
+        first_error: Exception | None = None
+        for node in itertools.chain(
+            self._internal_arrays.values(),
+            self._internal_tables.values(),
+            self._sres_nodes.values(),
+            self._desc_nodes.values(),
+            (self.root_node,),
+        ):
+            if node.uri in seen_uris:
+                continue
+            seen_uris.add(node.uri)
+            try:
+                node.close_stream()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+                logger.exception("Failed to close Tiled stream %s", node.uri)
+        if first_error is not None:
+            raise first_error
 
     def stop(self, doc: RunStop):
         if self.root_node is None:
@@ -977,91 +1060,18 @@ class _RunWriter(DocumentRouter):
             if cons_md := consolidator.metadata:
                 sres_node.update_metadata(metadata=cons_md, drop_revision=True)
 
-        # Validate the Structure of the data for each external resource, if requested
-        # Try validating directly on the server, first; if endpoint is not available, do it locally
-        try:
-            if self._validate:
-                for attempt in retry_context():
-                    with attempt:
-                        response = self.root_node.context.http_client.post(
-                            self.root_node.uri.replace(
-                                "/api/v1/metadata/", "/custom/validate/", 1
-                            ),
-                            params={"fix": True},
-                            content=safe_json_dump(
-                                {"ignore_errors": self.ignore_errors}
-                            ),
-                        )
+        # Write the stop document to the metadata, include notes from the normalizer, if any
+        notes = list(dict.fromkeys(doc.pop("_run_normalizer_notes", []) + self.notes))
+        md_update = {"stop": doc, **({"notes": notes} if notes else {})}
+        self.root_node.update_metadata(metadata=md_update, drop_revision=True)
 
-                try:
-                    content = handle_error(response).json()
-                    _notes = content.get("notes", [])
-                    if content.get("valid"):
-                        self.notes.extend(_notes)
-                        for note in _notes:
-                            warnings.warn("Remote validation: " + note, stacklevel=2)
-                        if not _notes:
-                            logger.info(
-                                "Remote validation successful for all external data."
-                            )
-                    else:
-                        msg = "Remote validation failed: " + "; ".join(_notes)
-                        raise ValidationException(msg, self.root_node.item["id"])
-
-                except httpx.HTTPStatusError as e:
-                    # Backcompatibility: if the server does not support validation endpoint,
-                    # it will return 404 Not Found error; in this case, attempt to validate
-                    # the data structure locally with the Consolidator.
-
-                    if response.status_code in (httpx.codes.NOT_FOUND, httpx.codes.UNAUTHORIZED):
-                        warnings.warn(
-                            "Tiled server does not support remote validation. "
-                            "Attempting to validate the data structure locally."
-                        )
-                        for sres_node, consolidator in node_and_cons:
-                            title = f"Validation of '{sres_node.item['id']}'"
-                            try:
-                                _notes = consolidator.validate(fix_errors=True)
-                                self.notes.extend(
-                                    [title + ": " + note for note in _notes]
-                                )
-                            except Exception as e:
-                                msg = (
-                                    f"{type(e).__name__}: "
-                                    + str(e)
-                                    .replace("\n", " ")
-                                    .replace("\r", "")
-                                    .strip()
-                                )
-                                msg = title + f" failed with error: {msg}"
-                                if any(
-                                    re.search(ptrn, msg) for ptrn in self.ignore_errors
-                                ):
-                                    warnings.warn(msg)
-                                else:
-                                    raise ValidationException(
-                                        msg, sres_node.item["id"]
-                                    ) from e
-                            self._update_data_source_for_node(
-                                sres_node, consolidator.get_data_source()
-                            )
-                    else:
-                        msg = (
-                            "Remote validation request failed with status code "
-                            f"{response.status_code}: {response.text}"
-                        )
-                        raise ValidationException(msg, self.root_node.item["id"]) from e
-
-        except Exception:
-            raise
-
-        finally:
-            # Write the stop document to the metadata, include notes from the normalizer, if any
-            notes = list(
-                dict.fromkeys(doc.pop("_run_normalizer_notes", []) + self.notes)
+        # Validate the run if requested; this will raise an error if the run is invalid.
+        # TODO: Validation in TiledWriter is deprecated and will be removed in a future release.
+        if self._validate:
+            self.root_node.validate(
+                ignore_errors=self.ignore_errors, raise_on_error=True
             )
-            md_update = {"stop": doc, **({"notes": notes} if notes else {})}
-            self.root_node.update_metadata(metadata=md_update, drop_revision=True)
+        self._close_stream_tree()
 
     def descriptor(self, doc: EventDescriptor):
         desc_name = doc["name"]  # Name of the descriptor/stream
@@ -1234,7 +1244,7 @@ class TiledWriter:
         backup_dictionary: dict | None = None,
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
-        validate: bool = False,
+        validate: Optional[bool] = None,
         ignore_errors: Optional[list[str]] = None,
     ):
         """Callback for writing metadata and data from Bluesky documents into Tiled.
@@ -1289,7 +1299,15 @@ class TiledWriter:
         self._run_router = RunRouter([self._factory])
         self._batch_size = batch_size
         self._max_array_size = max_array_size
-        self._validate = validate
+        if validate:
+            warnings.warn(
+                "The `validate` argument of TiledWriter is deprecated and will be removed in a "
+                "future release. Please consider validating the run after it has been written "
+                "using the `BlueskyRunV3.validate` method on the Tiled client instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self._validate = bool(validate)
         self.ignore_errors = ignore_errors or []
 
     def _factory(self, name, doc):
@@ -1337,7 +1355,7 @@ class TiledWriter:
         backup_directory: str | None = None,
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
-        validate: bool = False,
+        validate: Optional[bool] = None,
         **kwargs,
     ):
         client = from_uri(uri, **kwargs)
@@ -1363,7 +1381,7 @@ class TiledWriter:
         backup_directory: str | None = None,
         batch_size: int = BATCH_SIZE,
         max_array_size: int = MAX_ARRAY_SIZE,
-        validate: bool = False,
+        validate: Optional[bool] = None,
         **kwargs,
     ):
         client = from_profile(profile, **kwargs)
