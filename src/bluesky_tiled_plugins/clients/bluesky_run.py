@@ -542,7 +542,7 @@ class BlueskyRunV3(_BlueskyRunSQL):
 
             if response.status_code == httpx.codes.NOT_FOUND:
                 warnings.warn(
-                    "Tiled server does not support remote validation. "
+                    f"Tiled server encountered an error during validation: {response.status_code}. "
                     "Attempting to validate the data structure by the client.",
                     stacklevel=2,
                 )

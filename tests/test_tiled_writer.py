@@ -1,10 +1,14 @@
 import json
+import logging
 import os
+import uuid
 from collections.abc import Iterator
 from typing import cast
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 
+from bluesky import RunEngine
 import bluesky.plan_stubs as bps
 import bluesky.plans as bp
 import h5py
@@ -24,6 +28,7 @@ from event_model.documents.event_descriptor import DataKey
 from event_model.documents.stream_datum import StreamDatum
 from event_model.documents.stream_resource import StreamResource
 from tiled.client import record_history
+from tiled.client.utils import ClientError
 from tiled.utils import safe_json_dump
 from examples.render import render_templated_documents
 
@@ -31,12 +36,12 @@ from bluesky_tiled_plugins import TiledWriter
 from bluesky_tiled_plugins.writing.validator import ValidationException
 
 
-# Many fixtures in this module do not set join_method explicitly and thus rely on the
-# default, which currently triggers a DeprecationWarning announcing the upcoming change
-# of the default to "stack". Silence it at the module level so the strict
-# filterwarnings=["error"] policy does not turn expected usage into errors.
+# Several fixtures in this module intentionally exercise the (deprecated but still
+# supported) join_method="concat" layout. The dedicated test for the deprecation
+# warning lives in test_consolidators.py; here we silence it so the strict
+# filterwarnings=["error"] policy does not turn expected concat usage into errors.
 pytestmark = pytest.mark.filterwarnings(
-    "ignore:.*default value of join_method will change.*:DeprecationWarning"
+    "ignore:.*join_method='concat'.*:DeprecationWarning"
 )
 
 
@@ -72,6 +77,7 @@ class StreamDatumReadableCollectable(Named, Readable, Collectable, WritesStreamA
                 parameters={
                     "dataset": hdf5_dataset,
                     "chunk_shape": (100, *data_shape[1:]),
+                    "join_method": "concat",
                 },
                 data_key=data_key,
                 root=self.root,
@@ -260,6 +266,123 @@ def test_stream_datum_readable_counts(RE, client, tmp_path):
     assert stream[keys[2]].read() is not None
 
 
+@pytest.mark.parametrize(
+    ("frames_per_event", "frames_per_file", "descriptor_shape", "extra_params"),
+    [
+        (3, 1, [3, 5, 7], {"chunk_shape": [1, 5, 7]}),
+        (6, 2, [6, 5, 7], {"chunk_shape": [2, 5, 7]}),
+        (3, 1, [5, 7], {"chunk_shape": [1], "multiplier": 3}),
+    ],
+    ids=["single-frame-files", "multi-frame-files", "legacy-multiplier"],
+)
+def test_stacked_tiff_multiple_files_per_datum(
+    client, tmp_path, frames_per_event, frames_per_file, descriptor_shape, extra_params
+):
+    data = np.arange(2 * frames_per_event * 5 * 7, dtype=np.uint16).reshape(
+        2, frames_per_event, 5, 7
+    )
+    files = data.reshape(-1, frames_per_file, 5, 7)
+    for index, frames in enumerate(files):
+        image = frames[0] if frames_per_file == 1 else frames
+        tf.imwrite(tmp_path / f"{index}.tif", image, photometric="minisblack")
+
+    run_uid = uuid.uuid4().hex
+    descriptor_uid = uuid.uuid4().hex
+    resource_uid = uuid.uuid4().hex
+    documents = [
+        ("start", {"uid": run_uid, "time": 0.0}),
+        (
+            "descriptor",
+            {
+                "uid": descriptor_uid,
+                "run_start": run_uid,
+                "time": 0.0,
+                "name": "primary",
+                "data_keys": {
+                    "image": {
+                        "source": "file",
+                        "dtype": "array",
+                        "dtype_numpy": data.dtype.str,
+                        "shape": descriptor_shape,
+                        "external": "STREAM:",
+                        "object_name": "detector",
+                    }
+                },
+                "object_keys": {"detector": ["image"]},
+                "configuration": {},
+                "hints": {},
+            },
+        ),
+        (
+            "stream_resource",
+            {
+                "uid": resource_uid,
+                "run_start": run_uid,
+                "data_key": "image",
+                "mimetype": "multipart/related;type=image/tiff",
+                "uri": f"{tmp_path.as_uri()}/",
+                "parameters": {
+                    "template": "{:d}.tif",
+                    **extra_params,
+                },
+            },
+        ),
+        (
+            "stream_datum",
+            {
+                "uid": f"{resource_uid}/0",
+                "stream_resource": resource_uid,
+                "descriptor": descriptor_uid,
+                "indices": {"start": 0, "stop": 1},
+                "seq_nums": {"start": 1, "stop": 2},
+            },
+        ),
+        (
+            "stream_datum",
+            {
+                "uid": f"{resource_uid}/1",
+                "stream_resource": resource_uid,
+                "descriptor": descriptor_uid,
+                "indices": {"start": 1, "stop": 2},
+                "seq_nums": {"start": 2, "stop": 3},
+            },
+        ),
+        (
+            "stop",
+            {
+                "uid": uuid.uuid4().hex,
+                "run_start": run_uid,
+                "time": 1.0,
+                "exit_status": "success",
+                "reason": "",
+                "num_events": {"primary": 2},
+            },
+        ),
+    ]
+
+    writer = TiledWriter(client)
+    for name, document in documents:
+        writer(name=name, doc=document)
+
+    array = client[run_uid]["primary"]["image"]
+    data_source = array.data_sources()[0]
+    assert [
+        os.path.basename(urlparse(asset.data_uri).path) for asset in data_source.assets
+    ] == [f"{index}.tif" for index in range(len(files))]
+
+    actual = array.read()
+    assert actual.shape == (2, frames_per_event, 5, 7)
+    np.testing.assert_array_equal(actual, data)
+
+    actual = array.read(0)
+    assert actual.shape == (frames_per_event, 5, 7)
+    np.testing.assert_array_equal(actual, data[0])
+
+    actual = array.read((0, 1))
+    assert actual.shape == (5, 7)
+    np.testing.assert_array_equal(actual, data[0, 1])
+
+
 def test_stream_datum_readable_with_two_detectors(RE, client, tmp_path):
     det1 = StreamDatumReadableCollectable(name="det1", root=str(tmp_path))
     det2 = StreamDatumReadableCollectable(name="det2", root=str(tmp_path))
@@ -292,6 +415,33 @@ def test_stream_datum_collectable(RE, client, tmp_path):
     assert stream[keys[0]].read() is not None
     assert stream[keys[1]].read() is not None
     assert stream[keys[2]].read() is not None
+
+
+def test_tiled_specs_from_start_doc(RE: RunEngine, client):
+    """Custom specs passed via `tiled_specs` are attached to the run container."""
+    tw = TiledWriter(client)
+    RE(
+        bp.count([ophyd.sim.det], 1),
+        tw,
+        tiled_specs=[{"name": "XAS_Calib", "version": "1.0"}, "TomographyFlyscan"],
+    )
+    run = client.values().last()
+    specs = {spec.name: spec.version for spec in run.specs}
+
+    assert specs["BlueskyRun"] == "3.0"
+    assert specs["XAS_Calib"] == "1.0"
+    assert "TomographyFlyscan" in specs
+    # The marker key is consumed by the writer and not stored in start metadata.
+    assert "tiled_specs" not in run.metadata["start"]
+
+
+def test_no_tiled_specs_leaves_default_spec(RE, client):
+    """Without `tiled_specs`, only the default BlueskyRun spec is present."""
+    tw = TiledWriter(client)
+    RE(bp.count([ophyd.sim.det], 1), tw)
+    run = client.values().last()
+
+    assert [spec.name for spec in run.specs] == ["BlueskyRun"]
 
 
 @pytest.mark.parametrize("frames_per_event", [1, 5, 10])
@@ -371,6 +521,34 @@ def test_dims_names(client, external_assets_folder):
     assert run["primary"]["det-key2"].structure().dims == ("time", "dim_x", "dim_y")
 
 
+def test_stack_consolidation_with_named_dimensions(client, tmp_path):
+    expected = np.arange(3 * 4096, dtype="<i8").reshape(3, 1, 4096)
+    with h5py.File(tmp_path / "dataset.h5", "w") as file:
+        file.create_group("entry").create_group("data").create_dataset(
+            "data_2", data=expected
+        )
+
+    tw = TiledWriter(client)
+    for item in render_templated_documents(
+        "external_assets_single_key.json", tmp_path.as_posix()
+    ):
+        name, doc = item["name"], item["doc"]
+        if name == "start":
+            uid = doc["uid"]
+        elif name == "descriptor":
+            doc["data_keys"]["det-key2"]["shape"] = [1, 4096]
+            doc["data_keys"]["det-key2"]["dims"] = ["frame", "bin_count"]
+        elif name == "stream_resource":
+            doc["parameters"]["chunk_shape"] = [1, 1, 4096]
+        tw(name, doc)
+
+    stream = client[uid]["primary"]
+    assert stream["det-key2"].shape == (3, 1, 4096)
+    actual = stream.read()["det-key2"]
+    assert actual.dims == ("time", "frame", "bin_count")
+    np.testing.assert_array_equal(actual.values, expected)
+
+
 @pytest.mark.parametrize(
     "batch_size, expected_patch_shapes, expected_patch_offsets",
     [(1, (1, 1, 1), (0, 1, 2)), (2, (2, 1), (0, 2)), (5, (3,), (0,))],
@@ -435,6 +613,9 @@ def test_data_source_patching(
         assert actual_patch_offsets == expected_patch_offsets
 
 
+@pytest.mark.filterwarnings(
+    "ignore:The .validate. argument of TiledWriter is deprecated:DeprecationWarning"
+)
 @pytest.mark.parametrize("error_type", ["shape", "chunks", "dtype", "dims"])
 @pytest.mark.parametrize("validate", [True, False])
 def test_validate_external_data(client, external_assets_folder, error_type, validate):
@@ -450,7 +631,7 @@ def test_validate_external_data(client, external_assets_folder, error_type, vali
 
         # Modify the document to introduce an error
         if (error_type == "shape") and (name == "descriptor"):
-            doc["data_keys"]["det-key2"]["shape"] = [1, 2, 3]  # should be [1, 13, 17]
+            doc["data_keys"]["det-key2"]["shape"] = [2, 3]  # should be [13, 17]
         elif (error_type == "chunks") and name in {"resource", "stream_resource"}:
             doc["parameters"]["chunk_shape"] = [1, 2, 3]  # should be [3, 13, 17]
         elif (error_type == "dtype") and (name == "descriptor"):
@@ -458,10 +639,7 @@ def test_validate_external_data(client, external_assets_folder, error_type, vali
                 "int32"
             ).str  # should be "int64"
         elif (error_type == "dims") and (name == "descriptor"):
-            item["doc"]["data_keys"]["det-key2"]["dims"] = [
-                "dim_2",
-                "dim_3",
-            ]  # Missing time dim
+            doc["data_keys"]["det-key2"]["dims"] = ["dim_2", "dim_3", "extra"]
 
         # Check that the warning is issued when data changes during the validation
         if name == "stop" and validate:
@@ -473,8 +651,11 @@ def test_validate_external_data(client, external_assets_folder, error_type, vali
     # Try reading the imported data
     run = client[uid]
     if not validate and not error_type == "chunks":
-        with pytest.raises(ValueError):
-            assert run["primary"].read() is not None
+        # An inconsistent array cannot be read back. Depending on the Tiled
+        # version, the mismatch either fails to reshape client-side
+        # (`ValueError`) or is rejected by the server (`ClientError`).
+        with pytest.raises((ValueError, ClientError)):
+            run["primary"].read()
     else:
         assert run["primary"].read() is not None
         assert run["primary"]["det-key2"].read().shape == (3, 13, 17)
@@ -491,6 +672,9 @@ def test_validate_external_data(client, external_assets_folder, error_type, vali
     ),
 )
 @pytest.mark.filterwarnings("ignore::UserWarning")
+@pytest.mark.filterwarnings(
+    "ignore:The .validate. argument of TiledWriter is deprecated:DeprecationWarning"
+)
 def test_ignore_validation_errors(client, external_assets_folder, ignore_errors):
     tw = TiledWriter(client, validate=True, ignore_errors=ignore_errors)
 
@@ -587,6 +771,9 @@ def test_slice_and_squeeze(client, external_assets_folder, squeeze):
     assert client[uid]["primary"].read() is not None
 
 
+@pytest.mark.filterwarnings(
+    "ignore:The .validate. argument of TiledWriter is deprecated:DeprecationWarning"
+)
 @pytest.mark.parametrize("multiplier_key", ["multiplier", "frame_per_point"])
 @pytest.mark.parametrize("validate", [True, False])
 def test_legacy_with_multiplier_parameter(
@@ -787,7 +974,10 @@ def test_json_backup(client, tmpdir, monkeypatch):
     )  # The Descriptor was processed and the primary stream was created
     assert run["primary"].read() is not None  # The stream can be read
     assert len(run["primary"].read()) == 0  # No events were processed due to the error
-    assert "stop" in run.metadata  # The TiledWriter did not crash
+    # Once the primary callback has failed, it is abandoned for the rest of the
+    # run: the failed (partial) run must NOT receive a stop document, so it can
+    # not masquerade as a complete run. The full run lives in the backup.
+    assert "stop" not in run.metadata
 
     # Check that the backup file was created
     filepath = tmpdir / f"{uid[:8]}.jsonl"
@@ -801,26 +991,68 @@ def test_json_backup(client, tmpdir, monkeypatch):
     assert lines[6]["name"] == "stop"
 
 
+class _LoseAppendResponseOnce(httpx.BaseTransport):
+    """Forward the first PATCH /table/partition request to the wrapped transport
+    -- so the server fully processes the append -- but raise ReadTimeout to the
+    caller, simulating a lost response for an append that actually succeeded."""
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+        self.tripped = False
+
+    def handle_request(self, request):
+        response = self._wrapped.handle_request(request)
+        if (
+            not self.tripped
+            and request.method == "PATCH"
+            and "/table/partition/" in str(request.url)
+        ):
+            self.tripped = True
+            raise httpx.ReadTimeout("Simulated lost response", request=request)
+        return response
+
+
+def test_event_append_retried_with_possible_duplication(
+    RE, client, monkeypatch, caplog
+):
+    """A failed internal-table append (e.g. a lost response) must not kill the
+    scan: TiledWriter warns, records a note in the run metadata, and forces a
+    retry -- accepting possibly duplicated rows (at-least-once semantics for
+    event data; the Tiled client itself deliberately does not retry appends
+    whose request may have been processed)."""
+    transport = _LoseAppendResponseOnce(client.context.http_client._transport)
+    monkeypatch.setattr(client.context.http_client, "_transport", transport)
+
+    tw = TiledWriter(client)
+    with caplog.at_level(logging.WARNING):
+        RE(bp.count([ophyd.sim.det], 3), tw)
+
+    assert transport.tripped
+    run = client.values().last()
+    assert "stop" in run.metadata  # The run completed normally
+
+    # The first (lost-response) append landed server-side and the forced retry
+    # appended the same batch again: rows are duplicated, none are lost.
+    internal_table = run["primary"].base["internal"].read()
+    assert sorted(internal_table["seq_num"]) == [1, 1, 2, 2, 3, 3]
+
+    # The possible duplication is discoverable: a warning was logged and a note
+    # was recorded in the run metadata.
+    assert any("forcing a retry" in record.getMessage() for record in caplog.records)
+    assert any("may be duplicated" in note for note in run.metadata.get("notes", []))
+
+
 @pytest.mark.parametrize(
     "max_array_size, expected_scheme",
     [
-        pytest.param(
-            0,
-            "file",
-            marks=pytest.mark.xfail(
-                reason=(
-                    "internal_events.json has a data_key with a zero-length dimension; "
-                    "most zarr versions reject chunk edges of 0. Passes on zarr <3.2 "
-                    "and >=3.1; fails on zarr 2.x and zarr >=3.2."
-                ),
-                raises=(ZeroDivisionError, ValueError),
-                strict=False,
-            ),
-        ),
+        (0, "file"),
         (4, "file"),
         (16, "duckdb"),
         (-1, "duckdb"),
     ],
+)
+@pytest.mark.filterwarnings(
+    "ignore:Failed to convert ragged array to numpy:UserWarning"
 )
 def test_internal_arrays_written_as_zarr(client, max_array_size, expected_scheme):
     tw = TiledWriter(client, max_array_size=max_array_size)
@@ -843,6 +1075,59 @@ def test_internal_arrays_written_as_zarr(client, max_array_size, expected_scheme
         urlparse(internal_table.data_sources()[0].assets[0].data_uri).scheme == "duckdb"
     )
 
+    # String arrays are always written as zarr, regardless of their size, because
+    # they can not be stored in the SQL table in a readable form.
+    str_arr = run["primary"]["str_arr"]
+    str_arr_expected = np.array(
+        [["foo", "bar", "baz"], ["qux", "quux", "corge"], ["grault", "garply", "waldo"]]
+    )
+    assert str_arr.shape == (3, 3)
+    assert str_arr.read().dtype == np.dtype("<U6")
+    assert str_arr.read().shape == (3, 3)
+    assert np.array_equal(str_arr.read(), str_arr_expected)
+    assert "str_arr" not in internal_table.columns
+    assert urlparse(str_arr.data_sources()[0].assets[0].data_uri).scheme == "file"
+
+    # The "empty" data_key carries a zero-length array in every event. When
+    # classified as an internal (zarr) array (max_array_size == 0) it holds no
+    # data and can not be chunked by zarr, so it falls back to the tabular
+    # store instead of being written as a separate zarr node.
+    if max_array_size == 0:
+        assert "empty" not in run["primary"].base
+        assert "empty" in internal_table.columns
+
+    # An nD per-event array (2x3 strings) is stored as a 3D zarr array and read
+    # back with its full shape.
+    str_img = run["primary"]["str_img"]
+    assert str_img.shape == (3, 2, 3)
+    assert str_img.read()[0].tolist() == [["aa", "bb", "cc"], ["dd", "ee", "ff"]]
+    assert urlparse(str_img.data_sources()[0].assets[0].data_uri).scheme == "file"
+
+    # Internal dimension names: the event axis is always "time"; inner dims are
+    # named per size with a "dim_int_" prefix and shared across keys so
+    # equal-sized dimensions align in the xarray Dataset.
+    str_arr_dims = run["primary"].base["str_arr"].dims
+    str_img_dims = run["primary"].base["str_img"].dims
+    assert str_arr_dims[0] == str_img_dims[0] == "time"
+    assert all(d.startswith("dim_int_") for d in str_arr_dims[1:] + str_img_dims[1:])
+    # str_arr (size 3) and str_img's trailing axis (size 3) share a name; the
+    # two str_img axes (sizes 2 and 3) get distinct names.
+    assert str_img_dims[2] == str_arr_dims[1]
+    assert str_img_dims[1] != str_img_dims[2]
+
+    # Ragged arrays: the variable-length (None) axis is named "dim_rgd_{axis}"
+    # while a fixed-size axis reuses a shared "dim_int_" name.
+    ragged_dims = run["primary"].base["ragged"].dims
+    assert ragged_dims[0] == "time"
+    assert ragged_dims[-1] == "dim_rgd_2"
+    assert ragged_dims[1].startswith("dim_int_")
+
+    # Tabular columns share the same "time" event axis as the zarr arrays, so
+    # the assembled dataset has no stray "dim0".
+    dataset = run["primary"].read()
+    assert "time" in dataset.sizes
+    assert "dim0" not in dataset.sizes
+
     if expected_scheme == "file":
         assert (
             "long" in run["primary"].base
@@ -854,14 +1139,110 @@ def test_internal_arrays_written_as_zarr(client, max_array_size, expected_scheme
             urlparse(run["primary"]["long"].data_sources()[0].assets[0].data_uri).scheme
             == "file"
         )
+        # The size-8 "long" axis gets a different name than the size-3 str_arr
+        # axis.
+        long_dims = run["primary"].base["long"].dims
+        assert long_dims[0] == "time"
+        assert long_dims[1].startswith("dim_int_")
+        assert long_dims[1] != str_arr_dims[1]
     else:
         assert "long" not in run["primary"].base
         assert "long" in internal_table.columns
         assert run["primary"]["long"].data_sources() is None
 
 
+def test_large_internal_table_split_into_multiple_nodes(client, monkeypatch):
+    """A stream whose internal table has more columns than `MAX_TABLE_COLUMNS`
+    is stored as several `internal_{i}` nodes, each holding a disjoint subset
+    of the columns; all columns remain readable through the stream.
+    """
+    from bluesky_tiled_plugins.writing import tiled_writer as tw_mod
+
+    monkeypatch.setattr(tw_mod, "MAX_TABLE_COLUMNS", 4)
+
+    ncols = 10
+    keys = [f"col_{i:03d}" for i in range(ncols)]
+    uid = uuid.uuid4().hex
+    desc_uid = uuid.uuid4().hex
+    docs = [
+        ("start", {"uid": uid, "time": 0.0}),
+        (
+            "descriptor",
+            {
+                "uid": desc_uid,
+                "run_start": uid,
+                "time": 0.0,
+                "name": "primary",
+                "data_keys": {
+                    k: {
+                        "source": "sim",
+                        "dtype": "number",
+                        "shape": [],
+                        "object_name": "det",
+                    }
+                    for k in keys
+                },
+                "object_keys": {"det": keys},
+            },
+        ),
+        (
+            "event",
+            {
+                "uid": uuid.uuid4().hex,
+                "descriptor": desc_uid,
+                "time": 0.0,
+                "seq_num": 1,
+                "data": {k: float(i) for i, k in enumerate(keys)},
+                "timestamps": {k: 0.0 for k in keys},
+                "filled": {},
+            },
+        ),
+        (
+            "stop",
+            {
+                "uid": uuid.uuid4().hex,
+                "run_start": uid,
+                "time": 1.0,
+                "exit_status": "success",
+                "num_events": {"primary": 1},
+            },
+        ),
+    ]
+
+    tw = TiledWriter(client)
+    for name, doc in docs:
+        tw(name=name, doc=doc)
+
+    run = client[uid]
+    base = run["primary"].base
+
+    # The internal table (data columns plus their `ts_` timestamps and
+    # `seq_num`/`time`) exceeds MAX_TABLE_COLUMNS and is split into a
+    # contiguously numbered set of `internal_{i}` nodes.
+    internal_nodes = sorted(k for k in base.keys() if k.startswith("internal"))
+    assert len(internal_nodes) > 1
+    assert internal_nodes == [f"internal_{i}" for i in range(len(internal_nodes))]
+
+    # Each part holds at most MAX_TABLE_COLUMNS columns, and every data key is
+    # stored in exactly one part.
+    for node_key in internal_nodes:
+        assert len(base[node_key].columns) <= 4
+    stored = [
+        c for node_key in internal_nodes for c in base[node_key].columns if c in keys
+    ]
+    assert sorted(stored) == keys
+
+    # All columns are still readable through the assembled stream.
+    dataset = run["primary"].read()
+    for i, k in enumerate(keys):
+        assert float(dataset[k].values[0]) == float(i)
+
+
 @pytest.mark.parametrize("corrupt_uri", [False, True])
 @pytest.mark.filterwarnings("ignore::UserWarning")
+@pytest.mark.filterwarnings(
+    "ignore:The .validate. argument of TiledWriter is deprecated:DeprecationWarning"
+)
 def test_bytes_roundtrip(client, external_assets_folder, corrupt_uri):
     """End-to-end registration of `bytes` data sources via `TiledWriter`.
 

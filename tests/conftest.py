@@ -98,7 +98,7 @@ def external_assets_folder(tmp_path_factory):
                 "data", data=rng.random(size=(1, 13, 17), dtype="float64")
             )
 
-    # Create a second external hdf5 file to be declared in a different stream resource
+    # Create another external hdf5 file to be declared in a different stream resource
     with h5py.File(temp_dir.joinpath("dataset_part2.h5"), "w") as file:
         grp = file.create_group("entry").create_group("data")
         grp.create_dataset(
